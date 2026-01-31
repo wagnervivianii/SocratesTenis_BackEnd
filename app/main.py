@@ -24,9 +24,11 @@ def root():
         "env": settings.env,
         "cors_origins": origins,
         "health": "/api/v1/health",
+        "shorts": "/api/v1/shorts",
         "docs": "/docs",
         "redoc": "/redoc",
     }
 
 
+# ✅ Tudo que é v1 fica centralizado no api_router
 app.include_router(api_router, prefix="/api/v1")

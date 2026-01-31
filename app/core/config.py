@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     # CORS (quando conectar React/Apps)
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+    # Banco
+    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/socratestennis"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
