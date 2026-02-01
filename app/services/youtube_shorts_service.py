@@ -38,7 +38,6 @@ KEYWORDS: list[str] = [
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 
-
 _DURATION_RE = re.compile(
     r"^P"
     r"(?:(?P<days>\d+)D)?"
@@ -105,6 +104,53 @@ def _get_config() -> YoutubeConfig:
     return YoutubeConfig(api_key=api_key)
 
 
+def _is_syndicable_embed(cfg: YoutubeConfig, v: dict[str, Any]) -> bool:
+    """
+    Filtros para reduzir vídeos que falham no iframe (Erro 153 / embed bloqueado).
+    Além de status.embeddable, o grande diferencial é buscar vídeos "syndicated"
+    (via search.videoSyndicated=true) e validar informações do player quando existirem.
+
+    Regras:
+    - status.embeddable precisa ser True
+    - status.privacyStatus precisa ser public
+    - age restricted costuma falhar em embed
+    - regionRestriction (quando existir) não pode bloquear o region_code
+    - player.embedHtml (quando disponível) deve existir
+    """
+    status = v.get("status") or {}
+    if status.get("embeddable") is not True:
+        return False
+
+    privacy = (status.get("privacyStatus") or "").lower()
+    if privacy and privacy != "public":
+        return False
+
+    content = v.get("contentDetails") or {}
+
+    # age restriction tende a quebrar embed / exigir login
+    content_rating = content.get("contentRating") or {}
+    if content_rating.get("ytRating") == "ytAgeRestricted":
+        return False
+
+    rr = content.get("regionRestriction") or {}
+    blocked = rr.get("blocked") or []
+    if isinstance(blocked, list) and cfg.region_code in blocked:
+        return False
+
+    allowed = rr.get("allowed") or []
+    if isinstance(allowed, list) and allowed and (cfg.region_code not in allowed):
+        return False
+
+    # Quando pedimos part=player, alguns vídeos não trazem embedHtml.
+    # Se não vier, descartamos (mais conservador, porém reduz erros).
+    player = v.get("player") or {}
+    embed_html = (player.get("embedHtml") or "").strip()
+    if not embed_html:
+        return False
+
+    return True
+
+
 async def _search_videos(client: httpx.AsyncClient, cfg: YoutubeConfig, query: str) -> list[str]:
     """
     Busca IDs de vídeos curtos e incorporáveis.
@@ -117,11 +163,15 @@ async def _search_videos(client: httpx.AsyncClient, cfg: YoutubeConfig, query: s
         "q": query,
         "maxResults": cfg.max_results,
         "safeSearch": cfg.safe_search,
-        "videoEmbeddable": "true",
         "videoDuration": "short",
         "regionCode": cfg.region_code,
         "relevanceLanguage": cfg.relevance_language,
         "order": "relevance",
+        # ✅ já filtra embed no SEARCH (ajuda)
+        "videoEmbeddable": "true",
+        # ✅ MUITO importante: força vídeos que podem tocar fora do youtube.com
+        # (reduz drasticamente erro 153)
+        "videoSyndicated": "true",
     }
 
     r = await client.get(YOUTUBE_SEARCH_URL, params=params)
@@ -151,10 +201,12 @@ async def _fetch_video_details(
     if not video_ids:
         return []
 
+    # ✅ pedimos player também para validar embedHtml
     params = {
         "key": cfg.api_key,
-        "part": "snippet,contentDetails",
+        "part": "snippet,contentDetails,status,player",
         "id": ",".join(video_ids[:50]),
+        "maxResults": 50,
     }
     r = await client.get(YOUTUBE_VIDEOS_URL, params=params)
     r.raise_for_status()
@@ -195,8 +247,8 @@ def _build_item(keyword: str, v: dict[str, Any]) -> dict[str, Any] | None:
     thumb = _pick_thumb(snippet)
 
     watch_url = f"https://www.youtube.com/watch?v={vid}"
-    # ✅ nocookie para reduzir tracking no embed
-    embed_url = f"https://www.youtube-nocookie.com/embed/{vid}"
+    # ✅ embed padrão (mais compatível que nocookie em muitos cenários)
+    embed_url = f"https://www.youtube.com/embed/{vid}"
 
     return {
         "keyword": keyword,
@@ -216,10 +268,10 @@ async def get_shorts_for_keyword(keyword: str, limit: int = 8) -> dict[str, Any]
     if not keyword:
         keyword = keyword_of_the_hour()
 
-    cache_key = f"k:{keyword}"
+    # ✅ versão do cache (mude ao alterar lógica / embed)
+    cache_key = f"k:{keyword}:v3"
     if cache_key in _cache:
         cached = _cache[cache_key]
-        # atualiza updated_at pra “agora”, mantendo items
         return {
             "keyword": cached["keyword"],
             "updated_at": datetime.now(tz=UTC),
@@ -227,6 +279,9 @@ async def get_shorts_for_keyword(keyword: str, limit: int = 8) -> dict[str, Any]
         }
 
     cfg = _get_config()
+
+    # ✅ aumenta o pool pra compensar filtros (syndicated/embeddable/player/duração)
+    cfg.max_results = min(50, max(cfg.max_results, limit * 8))
 
     headers = {
         "User-Agent": "SocratesTenisShorts/1.0",
@@ -238,10 +293,15 @@ async def get_shorts_for_keyword(keyword: str, limit: int = 8) -> dict[str, Any]
         details = await _fetch_video_details(client, cfg, video_ids)
 
     items: list[dict[str, Any]] = []
+
     for v in details:
+        if not _is_syndicable_embed(cfg, v):
+            continue
+
         item = _build_item(keyword, v)
         if item:
             items.append(item)
+
         if len(items) >= limit:
             break
 
