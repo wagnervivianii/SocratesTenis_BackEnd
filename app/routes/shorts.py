@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query
 
+# comentario para teste de automacao de push no pull no servidor
 from app.schemas.shorts import ShortsResponse
 from app.services.youtube_shorts_service import get_shorts_for_keyword, get_shorts_of_the_hour
 
