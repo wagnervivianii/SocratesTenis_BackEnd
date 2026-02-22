@@ -1,8 +1,18 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
-from app.core.config import settings
+
+# Carrega variáveis do .env no root do projeto (se existir),
+# sem sobrescrever variáveis já definidas no ambiente.
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env", override=False)
+
+# Importa settings somente após carregar o .env
+from app.core.config import settings  # noqa: E402
 
 app = FastAPI(title=settings.app_name, version=settings.version)
 
