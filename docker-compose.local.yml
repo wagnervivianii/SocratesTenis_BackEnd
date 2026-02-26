@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: socratestenis_postgres_local
+    environment:
+      POSTGRES_DB: socratestenis
+      POSTGRES_USER: socra
+      POSTGRES_PASSWORD: "UeYdW2TwrnvcMHgYovBbnbUgyW2vyRU/"
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    volumes:
+      - socratestenis_pgdata_local:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U socra -d socratestenis"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: socratestenis_pgadmin_local
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "admin@socratestenis.com"
+      PGADMIN_DEFAULT_PASSWORD: "admin123"
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    volumes:
+      - socratestenis_pgadmin_data_local:/var/lib/pgadmin
+    restart: unless-stopped
+
+volumes:
+  socratestenis_pgdata_local:
+  socratestenis_pgadmin_data_local:
