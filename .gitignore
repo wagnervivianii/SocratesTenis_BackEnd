@@ -26,3 +26,4 @@ dist/
 # IDEs / editors
 .idea/
 .vscode/
+scripts/
