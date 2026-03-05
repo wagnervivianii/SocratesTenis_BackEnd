@@ -1,3 +1,4 @@
+# app/models/user.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -31,6 +32,11 @@ class User(Base):
 
     role: Mapped[str] = mapped_column(Text, nullable=False, default="admin")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # ✅ novo: verificação de e-mail (null = não verificado)
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
