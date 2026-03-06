@@ -4,6 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -21,9 +22,19 @@ from app.core.security import (
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import LoginIn, MessageOut, TokenOut
+from app.services.email_sender import (
+    ConsoleEmailSender,
+    EmailSendError,
+    SmtpConfig,
+    SmtpEmailSender,
+)
+from app.services.email_verification import (
+    EmailVerificationExpired,
+    EmailVerificationInvalid,
+    EmailVerificationService,
+)
 
 router = APIRouter(prefix="/auth")
-
 DBSession = Annotated[Session, Depends(get_db)]
 
 
@@ -64,6 +75,20 @@ def _normalize_instagram(s: str | None) -> str | None:
     return v or None
 
 
+def _get_email_sender():
+    if settings.email_sender_backend.lower() == "smtp":
+        cfg = SmtpConfig(
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_username,
+            password=settings.smtp_password,
+            mail_from=settings.smtp_from,
+            use_tls=settings.smtp_use_tls,
+        )
+        return SmtpEmailSender(cfg)
+    return ConsoleEmailSender()
+
+
 class RegisterIn(BaseModel):
     full_name: str = Field(min_length=3, max_length=120)
     email: EmailStr
@@ -95,17 +120,13 @@ def login(data: LoginIn, response: Response, db: DBSession):
 
     access = create_access_token(subject=str(user.id))
     refresh = create_refresh_token(subject=str(user.id))
-
     _set_refresh_cookie(response, refresh)
 
-    return TokenOut(
-        access_token=access,
-        expires_in=settings.access_token_expire_minutes * 60,
-    )
+    return TokenOut(access_token=access, expires_in=settings.access_token_expire_minutes * 60)
 
 
 @router.post("/register", response_model=RegisterOut, status_code=status.HTTP_201_CREATED)
-def register(data: RegisterIn, db: DBSession):
+def register(data: RegisterIn, request: Request, db: DBSession):
     email = str(data.email).strip().lower()
     whatsapp_digits = _only_digits(data.whatsapp)
 
@@ -116,7 +137,6 @@ def register(data: RegisterIn, db: DBSession):
     full_name = data.full_name.strip()
 
     user = db.scalar(select(User).where((User.email == email) | (User.whatsapp == whatsapp_digits)))
-
     created = False
 
     if not user:
@@ -125,7 +145,7 @@ def register(data: RegisterIn, db: DBSession):
             password_hash=get_password_hash(data.password),
             full_name=full_name,
             role="staff",
-            is_active=True,
+            is_active=False,  # só ativa após verificação
             whatsapp=whatsapp_digits,
             instagram=instagram,
         )
@@ -135,12 +155,12 @@ def register(data: RegisterIn, db: DBSession):
         except Exception:
             db.rollback()
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Usuário já cadastrado",
+                status_code=status.HTTP_409_CONFLICT, detail="Usuário já cadastrado"
             ) from None
         db.refresh(user)
         created = True
 
+    # intenção (idempotente)
     intent_added = False
     try:
         res = db.execute(
@@ -157,10 +177,29 @@ def register(data: RegisterIn, db: DBSession):
         intent_added = bool(getattr(res, "rowcount", 0))
     except Exception:
         db.rollback()
+        raise HTTPException(status_code=500, detail="Falha ao registrar intenção") from None
+
+    # emitir token
+    svc = EmailVerificationService(ttl_minutes=settings.email_verify_ttl_minutes)
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    issued = svc.issue_for_user(db, user.id, ip=ip, user_agent=ua)
+
+    verify_link = f"{settings.public_api_url}/api/v1/auth/verify-email?token={issued.token}"
+
+    # enviar e-mail (smtp ou console)
+    sender = _get_email_sender()
+    try:
+        sender.send_verification_email(email, verify_link)
+    except EmailSendError as e:
+        # ✅ log detalhado só no servidor (não vazar pro usuário)
+        print(f"[EMAIL][ERROR] to={email} user={user.id} err={e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Falha ao registrar intenção",
+            status_code=500,
+            detail="Não foi possível enviar o e-mail de verificação. Tente novamente em instantes.",
         ) from None
+
+    print(f"[EMAIL-VERIFY] user={user.id} email={email} expires_at={issued.expires_at.isoformat()}")
 
     return RegisterOut(
         user_id=str(user.id),
@@ -175,36 +214,25 @@ def register(data: RegisterIn, db: DBSession):
 def refresh(request: Request, response: Response, db: DBSession):
     token = request.cookies.get(settings.refresh_cookie_name)
     if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token ausente"
-        )
+        raise HTTPException(status_code=401, detail="Refresh token ausente")
 
     try:
         claims = decode_refresh_token(token)
         if claims.get("type") != "refresh":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
-
-        user_id_str = safe_get_subject(claims)
-        user_id = UUID(user_id_str)
-
+            raise HTTPException(status_code=401, detail="Token inválido")
+        user_id = UUID(safe_get_subject(claims))
     except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token inválido",
-        ) from None
+        raise HTTPException(status_code=401, detail="Refresh token inválido") from None
 
     user = db.get(User, user_id)
     if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuário inválido")
+        raise HTTPException(status_code=401, detail="Usuário inválido")
 
     new_access = create_access_token(subject=str(user.id))
     new_refresh = create_refresh_token(subject=str(user.id))
     _set_refresh_cookie(response, new_refresh)
 
-    return TokenOut(
-        access_token=new_access,
-        expires_in=settings.access_token_expire_minutes * 60,
-    )
+    return TokenOut(access_token=new_access, expires_in=settings.access_token_expire_minutes * 60)
 
 
 @router.post("/logout", response_model=MessageOut)
@@ -216,3 +244,28 @@ def logout(response: Response):
 @router.get("/me")
 def me(user_id: str = Depends(get_current_user_id)):
     return {"user_id": user_id}
+
+
+@router.get("/verify-email")
+def verify_email(token: str, db: DBSession):
+    svc = EmailVerificationService(ttl_minutes=settings.email_verify_ttl_minutes)
+
+    ok_url = f"{settings.frontend_url}{settings.frontend_verify_redirect_path}?verified=1"
+    invalid_url = (
+        f"{settings.frontend_url}{settings.frontend_verify_redirect_path}?verified=0&reason=invalid"
+    )
+    expired_url = (
+        f"{settings.frontend_url}{settings.frontend_verify_redirect_path}?verified=0&reason=expired"
+    )
+
+    try:
+        user_id = svc.verify_token(db, token)
+    except EmailVerificationExpired:
+        return RedirectResponse(url=expired_url, status_code=status.HTTP_302_FOUND)
+    except EmailVerificationInvalid:
+        return RedirectResponse(url=invalid_url, status_code=status.HTTP_302_FOUND)
+
+    resp = RedirectResponse(url=ok_url, status_code=status.HTTP_302_FOUND)
+    refresh = create_refresh_token(subject=str(user_id))
+    _set_refresh_cookie(resp, refresh)
+    return resp
