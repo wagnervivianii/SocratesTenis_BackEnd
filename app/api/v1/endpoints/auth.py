@@ -1,3 +1,4 @@
+# app/api/v1/endpoints/auth.py
 from __future__ import annotations
 
 from typing import Annotated
@@ -127,25 +128,61 @@ def login(data: LoginIn, response: Response, db: DBSession):
 
 @router.post("/register", response_model=RegisterOut, status_code=status.HTTP_201_CREATED)
 def register(data: RegisterIn, request: Request, db: DBSession):
-    email = str(data.email).strip().lower()
+    """
+    Regras (UX forte):
+    - Se WhatsApp já existe: informar "já existe cadastro, faça login" (não reenvia e-mail)
+    - Se Email já existe e está ativo/verificado: informar "já existe cadastro, faça login"
+    - Se Email existe mas NÃO verificou: reenvia e-mail de verificação
+    - Se não existe: cria users (is_active=false) + envia verificação
+    """
+    input_email = str(data.email).strip().lower()
     whatsapp_digits = _only_digits(data.whatsapp)
 
     if len(whatsapp_digits) not in (10, 11):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="WhatsApp inválido")
+        raise HTTPException(status_code=400, detail="WhatsApp inválido")
 
     instagram = _normalize_instagram(data.instagram)
     full_name = data.full_name.strip()
 
-    user = db.scalar(select(User).where((User.email == email) | (User.whatsapp == whatsapp_digits)))
-    created = False
+    # 1) prioridade: whatsapp (se já existe, manda logar)
+    user_by_whatsapp = None
+    if whatsapp_digits:
+        user_by_whatsapp = db.scalar(select(User).where(User.whatsapp == whatsapp_digits))
 
-    if not user:
+    if user_by_whatsapp:
+        # Se já está verificado/ativo → login direto
+        if user_by_whatsapp.is_active and user_by_whatsapp.email_verified_at is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Já existe um cadastro com este WhatsApp. Faça login.",
+            )
+        # Mesmo se não estiver verificado, por UX você pediu: não reenviar, pedir login
+        raise HTTPException(
+            status_code=409,
+            detail="Já existe um cadastro com este WhatsApp. Faça login.",
+        )
+
+    # 2) depois: email
+    user_by_email = db.scalar(select(User).where(User.email == input_email))
+    created = False
+    user = user_by_email
+
+    if user:
+        # Se já está verificado/ativo → login
+        if user.is_active and user.email_verified_at is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Este e-mail já está cadastrado. Faça login.",
+            )
+        # Se existe mas não verificou: vamos reenviar e-mail
+    else:
+        # cria pendente (inativo) até verificar
         user = User(
-            email=email,
+            email=input_email,
             password_hash=get_password_hash(data.password),
             full_name=full_name,
             role="staff",
-            is_active=False,  # só ativa após verificação
+            is_active=False,
             whatsapp=whatsapp_digits,
             instagram=instagram,
         )
@@ -154,9 +191,7 @@ def register(data: RegisterIn, request: Request, db: DBSession):
             db.commit()
         except Exception:
             db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Usuário já cadastrado"
-            ) from None
+            raise HTTPException(status_code=409, detail="Usuário já cadastrado") from None
         db.refresh(user)
         created = True
 
@@ -179,7 +214,7 @@ def register(data: RegisterIn, request: Request, db: DBSession):
         db.rollback()
         raise HTTPException(status_code=500, detail="Falha ao registrar intenção") from None
 
-    # emitir token
+    # enviar verificação (novo ou reenvio)
     svc = EmailVerificationService(ttl_minutes=settings.email_verify_ttl_minutes)
     ip = request.client.host if request.client else None
     ua = request.headers.get("user-agent")
@@ -187,26 +222,26 @@ def register(data: RegisterIn, request: Request, db: DBSession):
 
     verify_link = f"{settings.public_api_url}/api/v1/auth/verify-email?token={issued.token}"
 
-    # enviar e-mail (smtp ou console)
     sender = _get_email_sender()
     try:
-        sender.send_verification_email(email, verify_link)
+        sender.send_verification_email(user.email, verify_link)
     except EmailSendError as e:
-        # ✅ log detalhado só no servidor (não vazar pro usuário)
-        print(f"[EMAIL][ERROR] to={email} user={user.id} err={e}")
+        print(f"[EMAIL][ERROR] to={user.email} user={user.id} err={e}")
         raise HTTPException(
             status_code=500,
             detail="Não foi possível enviar o e-mail de verificação. Tente novamente em instantes.",
         ) from None
 
-    print(f"[EMAIL-VERIFY] user={user.id} email={email} expires_at={issued.expires_at.isoformat()}")
+    print(
+        f"[EMAIL-VERIFY] user={user.id} email={user.email} expires_at={issued.expires_at.isoformat()}"
+    )
 
     return RegisterOut(
         user_id=str(user.id),
         created=created,
         intent_added=intent_added,
         intent=data.intent,
-        email=email,
+        email=user.email,
     )
 
 
