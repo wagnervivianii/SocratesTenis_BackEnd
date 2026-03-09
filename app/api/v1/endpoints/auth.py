@@ -90,6 +90,16 @@ def _get_email_sender():
     return ConsoleEmailSender()
 
 
+def _raise_register_conflict(code: str, message: str) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": code,
+            "message": message,
+        },
+    )
+
+
 class RegisterIn(BaseModel):
     full_name: str = Field(min_length=3, max_length=120)
     email: EmailStr
@@ -104,6 +114,10 @@ class RegisterOut(BaseModel):
     created: bool
     intent_added: bool
     intent: str
+    email: EmailStr
+
+
+class ResendVerificationIn(BaseModel):
     email: EmailStr
 
 
@@ -130,9 +144,10 @@ def login(data: LoginIn, response: Response, db: DBSession):
 def register(data: RegisterIn, request: Request, db: DBSession):
     """
     Regras (UX forte):
-    - Se WhatsApp já existe: informar "já existe cadastro, faça login" (não reenvia e-mail)
-    - Se Email já existe e está ativo/verificado: informar "já existe cadastro, faça login"
-    - Se Email existe mas NÃO verificou: reenvia e-mail de verificação
+    - Se WhatsApp já existe: informar especificamente que o WhatsApp já consta
+    - Se Email já existe e está ativo/verificado: informar especificamente que o e-mail já consta
+    - Se Email e WhatsApp já existem: informar ambos
+    - Se Email existe mas NÃO verificou (e sem conflito de WhatsApp): reenvia e-mail de verificação
     - Se não existe: cria users (is_active=false) + envia verificação
     """
     input_email = str(data.email).strip().lower()
@@ -144,39 +159,49 @@ def register(data: RegisterIn, request: Request, db: DBSession):
     instagram = _normalize_instagram(data.instagram)
     full_name = data.full_name.strip()
 
-    # 1) prioridade: whatsapp (se já existe, manda logar)
+    user_by_email = db.scalar(select(User).where(User.email == input_email))
     user_by_whatsapp = None
     if whatsapp_digits:
         user_by_whatsapp = db.scalar(select(User).where(User.whatsapp == whatsapp_digits))
 
-    if user_by_whatsapp:
-        # Se já está verificado/ativo → login direto
-        if user_by_whatsapp.is_active and user_by_whatsapp.email_verified_at is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Já existe um cadastro com este WhatsApp. Faça login.",
+    email_exists = user_by_email is not None
+    whatsapp_exists = user_by_whatsapp is not None
+
+    # 1) conflito combinado
+    if email_exists and whatsapp_exists:
+        same_user = user_by_email.id == user_by_whatsapp.id
+
+        if same_user and (
+            user_by_email.is_active is False or user_by_email.email_verified_at is None
+        ):
+            user = user_by_email
+            created = False
+        else:
+            _raise_register_conflict(
+                "EMAIL_AND_WHATSAPP_ALREADY_EXIST",
+                "Este e-mail e este WhatsApp já constam no sistema. Faça login para continuar.",
             )
-        # Mesmo se não estiver verificado, por UX você pediu: não reenviar, pedir login
-        raise HTTPException(
-            status_code=409,
-            detail="Já existe um cadastro com este WhatsApp. Faça login.",
+
+    # 2) conflito só de WhatsApp
+    elif whatsapp_exists:
+        _raise_register_conflict(
+            "WHATSAPP_ALREADY_EXISTS",
+            "Já existe um cadastro com este WhatsApp.",
         )
 
-    # 2) depois: email
-    user_by_email = db.scalar(select(User).where(User.email == input_email))
-    created = False
-    user = user_by_email
-
-    if user:
-        # Se já está verificado/ativo → login
-        if user.is_active and user.email_verified_at is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Este e-mail já está cadastrado. Faça login.",
+    # 3) conflito só de e-mail
+    elif email_exists:
+        if user_by_email.is_active and user_by_email.email_verified_at is not None:
+            _raise_register_conflict(
+                "EMAIL_ALREADY_EXISTS",
+                "Este e-mail já está cadastrado. Faça login para continuar.",
             )
-        # Se existe mas não verificou: vamos reenviar e-mail
+
+        user = user_by_email
+        created = False
+
+    # 4) novo cadastro
     else:
-        # cria pendente (inativo) até verificar
         user = User(
             email=input_email,
             password_hash=get_password_hash(data.password),
@@ -187,15 +212,43 @@ def register(data: RegisterIn, request: Request, db: DBSession):
             instagram=instagram,
         )
         db.add(user)
+
         try:
             db.commit()
         except Exception:
             db.rollback()
+
+            retry_user_by_email = db.scalar(select(User).where(User.email == input_email))
+            retry_user_by_whatsapp = None
+            if whatsapp_digits:
+                retry_user_by_whatsapp = db.scalar(
+                    select(User).where(User.whatsapp == whatsapp_digits)
+                )
+
+            retry_email_exists = retry_user_by_email is not None
+            retry_whatsapp_exists = retry_user_by_whatsapp is not None
+
+            if retry_email_exists and retry_whatsapp_exists:
+                _raise_register_conflict(
+                    "EMAIL_AND_WHATSAPP_ALREADY_EXIST",
+                    "Este e-mail e este WhatsApp já constam no sistema. Faça login para continuar.",
+                )
+            if retry_whatsapp_exists:
+                _raise_register_conflict(
+                    "WHATSAPP_ALREADY_EXISTS",
+                    "Já existe um cadastro com este WhatsApp.",
+                )
+            if retry_email_exists:
+                _raise_register_conflict(
+                    "EMAIL_ALREADY_EXISTS",
+                    "Este e-mail já está cadastrado. Faça login para continuar.",
+                )
+
             raise HTTPException(status_code=409, detail="Usuário já cadastrado") from None
+
         db.refresh(user)
         created = True
 
-    # intenção (idempotente)
     intent_added = False
     try:
         res = db.execute(
@@ -214,7 +267,6 @@ def register(data: RegisterIn, request: Request, db: DBSession):
         db.rollback()
         raise HTTPException(status_code=500, detail="Falha ao registrar intenção") from None
 
-    # enviar verificação (novo ou reenvio)
     svc = EmailVerificationService(ttl_minutes=settings.email_verify_ttl_minutes)
     ip = request.client.host if request.client else None
     ua = request.headers.get("user-agent")
@@ -242,6 +294,49 @@ def register(data: RegisterIn, request: Request, db: DBSession):
         intent_added=intent_added,
         intent=data.intent,
         email=user.email,
+    )
+
+
+@router.post("/resend-verification", response_model=MessageOut)
+def resend_verification(data: ResendVerificationIn, request: Request, db: DBSession):
+    input_email = str(data.email).strip().lower()
+
+    user = db.scalar(select(User).where(User.email == input_email))
+
+    if not user:
+        return MessageOut(
+            message="Se existir uma conta pendente para este e-mail, um novo link de verificação foi enviado."
+        )
+
+    if user.is_active and user.email_verified_at is not None:
+        return MessageOut(message="Sua conta já está verificada. Faça login para continuar.")
+
+    svc = EmailVerificationService(ttl_minutes=settings.email_verify_ttl_minutes)
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    issued = svc.issue_for_user(db, user.id, ip=ip, user_agent=ua)
+
+    verify_link = f"{settings.public_api_url}/api/v1/auth/verify-email?token={issued.token}"
+
+    sender = _get_email_sender()
+    try:
+        sender.send_verification_email(user.email, verify_link)
+    except EmailSendError as e:
+        print(f"[EMAIL][ERROR][RESEND] to={user.email} user={user.id} err={e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "EMAIL_RESEND_FAILED",
+                "message": "Não foi possível reenviar o e-mail de verificação. Tente novamente em instantes.",
+            },
+        ) from None
+
+    print(
+        f"[EMAIL-VERIFY][RESEND] user={user.id} email={user.email} expires_at={issued.expires_at.isoformat()}"
+    )
+
+    return MessageOut(
+        message="Enviamos um novo link de verificação para o seu e-mail. Confira também a caixa de spam."
     )
 
 
