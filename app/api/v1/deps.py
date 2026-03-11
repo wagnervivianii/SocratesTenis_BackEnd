@@ -1,25 +1,36 @@
-from __future__ import annotations
+from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.core.security import decode_access_token, safe_get_subject
+from app.core.security import decode_token
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def get_current_user_id(token: str = Depends(oauth2_scheme)) -> str:
-    """
-    Lê Authorization: Bearer <token>
-    Valida access token e retorna o user_id (sub).
-    """
-    try:
-        claims = decode_access_token(token)
-        if claims.get("type") != "access":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
-        return safe_get_subject(claims)
-    except JWTError:
+def get_current_user_id(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+) -> str:
+    if credentials is None or not credentials.credentials:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido"
-        ) from None
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Não autenticado",
+        )
+
+    token = credentials.credentials
+    payload = decode_token(token)
+
+    if payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido",
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido",
+        )
+
+    return str(user_id)
