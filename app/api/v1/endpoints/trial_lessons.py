@@ -347,6 +347,186 @@ def _list_available_teachers(db: Session, start_at: datetime, end_at: datetime):
     return db.execute(sql, {"p_from": start_at, "p_to": end_at}).mappings().all()
 
 
+def _list_trial_bookable_slot_templates(
+    db: Session,
+    *,
+    start_day: date,
+    end_day: date,
+):
+    sql = text(
+        """
+        SELECT
+          bs.id,
+          bs.court_id,
+          c.name AS court_name,
+          bs.teacher_id,
+          t.full_name AS teacher_name,
+          bs.weekday,
+          bs.start_time,
+          bs.end_time,
+          bs.starts_on,
+          bs.ends_on
+        FROM public.bookable_slots bs
+        JOIN public.courts c
+          ON c.id = bs.court_id
+        JOIN public.teachers t
+          ON t.id = bs.teacher_id
+        WHERE bs.modality = 'trial_lesson'
+          AND bs.is_active IS TRUE
+          AND bs.teacher_id IS NOT NULL
+          AND bs.starts_on <= :end_day
+          AND (bs.ends_on IS NULL OR bs.ends_on >= :start_day)
+        ORDER BY
+          bs.weekday,
+          bs.start_time,
+          c.name,
+          t.full_name
+        """
+    )
+
+    return (
+        db.execute(
+            sql,
+            {
+                "start_day": start_day,
+                "end_day": end_day,
+            },
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _build_trial_slots_from_templates(
+    db: Session,
+    *,
+    templates,
+    start_day: date,
+    days: int,
+    max_allowed_date: date,
+) -> list[TrialLessonSlotOut]:
+    tz = _local_tz()
+    today = datetime.now(tz).date()
+    now_local = datetime.now(tz)
+
+    end_day = min(max_allowed_date, start_day + timedelta(days=days - 1))
+
+    slots: list[TrialLessonSlotOut] = []
+    seen: set[tuple[datetime, UUID, UUID]] = set()
+
+    total_days = (end_day - start_day).days + 1
+    for day_offset in range(total_days):
+        current_day = start_day + timedelta(days=day_offset)
+        weekday = current_day.isoweekday()
+
+        for row in templates:
+            if row["weekday"] != weekday:
+                continue
+
+            if current_day < row["starts_on"]:
+                continue
+
+            if row["ends_on"] is not None and current_day > row["ends_on"]:
+                continue
+
+            slot_start = datetime.combine(current_day, row["start_time"], tzinfo=tz)
+            slot_end = datetime.combine(current_day, row["end_time"], tzinfo=tz)
+
+            if int((slot_end - slot_start).total_seconds() / 60) != 30:
+                continue
+
+            if current_day == today and slot_start <= now_local:
+                continue
+
+            if not _slot_is_still_available(
+                db=db,
+                start_at=slot_start,
+                end_at=slot_end,
+                court_id=row["court_id"],
+                teacher_id=row["teacher_id"],
+            ):
+                continue
+
+            dedupe_key = (slot_start, row["court_id"], row["teacher_id"])
+            if dedupe_key in seen:
+                continue
+
+            seen.add(dedupe_key)
+
+            slots.append(
+                TrialLessonSlotOut(
+                    start_at=slot_start,
+                    end_at=slot_end,
+                    court_id=row["court_id"],
+                    court_name=row["court_name"],
+                    teacher_id=row["teacher_id"],
+                    teacher_name=row["teacher_name"],
+                )
+            )
+
+    slots.sort(key=lambda item: (item.start_at, item.court_name, item.teacher_name))
+    return slots
+
+
+def _build_legacy_trial_slots(
+    db: Session,
+    *,
+    start_day: date,
+    days: int,
+    slot_minutes: int,
+    day_start_hour: int,
+    day_end_hour: int,
+    max_allowed_date: date,
+) -> list[TrialLessonSlotOut]:
+    tz = _local_tz()
+    today = datetime.now(tz).date()
+
+    slots: list[TrialLessonSlotOut] = []
+
+    for day_offset in range(days):
+        current_day = start_day + timedelta(days=day_offset)
+
+        if current_day > max_allowed_date:
+            break
+
+        window_start = datetime.combine(current_day, time(hour=day_start_hour), tzinfo=tz)
+        window_end = datetime.combine(current_day, time(hour=day_end_hour), tzinfo=tz)
+
+        slot_delta = timedelta(minutes=slot_minutes)
+
+        if current_day == today:
+            now_local = datetime.now(tz)
+            earliest_start = _round_up_to_next_slot(now_local, slot_minutes)
+            slot_start = max(window_start, earliest_start)
+        else:
+            slot_start = window_start
+
+        while slot_start + slot_delta <= window_end:
+            slot_end = slot_start + slot_delta
+
+            available_courts = _list_available_courts(db, slot_start, slot_end)
+            available_teachers = _list_available_teachers(db, slot_start, slot_end)
+
+            if available_courts and available_teachers:
+                first_court = available_courts[0]
+                first_teacher = available_teachers[0]
+
+                slots.append(
+                    TrialLessonSlotOut(
+                        start_at=slot_start,
+                        end_at=slot_end,
+                        court_id=first_court["court_id"],
+                        court_name=first_court["court_name"],
+                        teacher_id=first_teacher["teacher_id"],
+                        teacher_name=first_teacher["teacher_name"],
+                    )
+                )
+
+            slot_start = slot_end
+
+    return slots
+
+
 def _slot_is_still_available(
     db: Session,
     start_at: datetime,
@@ -971,50 +1151,31 @@ def trial_lesson_slots(
 
     _validate_trial_date_window(start_day)
 
-    slots: list[TrialLessonSlotOut] = []
+    end_day = min(max_allowed_date, start_day + timedelta(days=days - 1))
+    templates = _list_trial_bookable_slot_templates(
+        db,
+        start_day=start_day,
+        end_day=end_day,
+    )
 
-    for day_offset in range(days):
-        current_day = start_day + timedelta(days=day_offset)
+    if templates:
+        return _build_trial_slots_from_templates(
+            db,
+            templates=templates,
+            start_day=start_day,
+            days=days,
+            max_allowed_date=max_allowed_date,
+        )
 
-        if current_day > max_allowed_date:
-            break
-
-        window_start = datetime.combine(current_day, time(hour=day_start_hour), tzinfo=tz)
-        window_end = datetime.combine(current_day, time(hour=day_end_hour), tzinfo=tz)
-
-        slot_delta = timedelta(minutes=slot_minutes)
-
-        if current_day == today:
-            now_local = datetime.now(tz)
-            earliest_start = _round_up_to_next_slot(now_local, slot_minutes)
-            slot_start = max(window_start, earliest_start)
-        else:
-            slot_start = window_start
-
-        while slot_start + slot_delta <= window_end:
-            slot_end = slot_start + slot_delta
-
-            available_courts = _list_available_courts(db, slot_start, slot_end)
-            available_teachers = _list_available_teachers(db, slot_start, slot_end)
-
-            if available_courts and available_teachers:
-                first_court = available_courts[0]
-                first_teacher = available_teachers[0]
-
-                slots.append(
-                    TrialLessonSlotOut(
-                        start_at=slot_start,
-                        end_at=slot_end,
-                        court_id=first_court["court_id"],
-                        court_name=first_court["court_name"],
-                        teacher_id=first_teacher["teacher_id"],
-                        teacher_name=first_teacher["teacher_name"],
-                    )
-                )
-
-            slot_start = slot_end
-
-    return slots
+    return _build_legacy_trial_slots(
+        db,
+        start_day=start_day,
+        days=days,
+        slot_minutes=slot_minutes,
+        day_start_hour=day_start_hour,
+        day_end_hour=day_end_hour,
+        max_allowed_date=max_allowed_date,
+    )
 
 
 @router.post(

@@ -1,4 +1,10 @@
+from app.models.bookable_slot import BookableSlot  # noqa: F401
+from app.models.class_group import ClassGroup  # noqa: F401
+from app.models.class_group_enrollment import ClassGroupEnrollment  # noqa: F401
+from app.models.class_group_schedule import ClassGroupSchedule  # noqa: F401
+from app.models.court import Court  # noqa: F401
 from app.models.event import Event  # noqa: F401
 from app.models.student import Student  # noqa: F401
+from app.models.teacher import Teacher  # noqa: F401
 from app.models.trial_lesson import TrialLesson  # noqa: F401
 from app.models.user import User  # noqa: F401
