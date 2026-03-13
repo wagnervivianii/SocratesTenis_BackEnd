@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
@@ -106,6 +108,29 @@ def _integrity_to_http(e: IntegrityError) -> HTTPException:
     orig = getattr(e, "orig", None)
     pgcode = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
 
+    constraint = None
+    diag = getattr(orig, "diag", None)
+    if diag is not None:
+        constraint = getattr(diag, "constraint_name", None)
+
+    if pgcode == "23P01":
+        if constraint == "ex_events_no_overlap_court":
+            return HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Conflito: a quadra já está ocupada nesse horário.",
+            )
+
+        if constraint == "ex_events_no_overlap_teacher":
+            return HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Conflito: o professor já está ocupado nesse horário.",
+            )
+
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Conflito: horário indisponível (sobreposição).",
+        )
+
     if pgcode == "23503":
         return HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -128,6 +153,169 @@ def _integrity_to_http(e: IntegrityError) -> HTTPException:
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"Erro ao salvar dados da turma: {str(orig) if orig else str(e)}",
     )
+
+
+def _local_tz() -> ZoneInfo:
+    return ZoneInfo("America/Sao_Paulo")
+
+
+def _group_lesson_window() -> tuple[datetime, datetime, date, date]:
+    tz = _local_tz()
+    window_start = datetime.now(tz)
+    window_end = window_start + timedelta(days=60)
+    return window_start, window_end, window_start.date(), window_end.date()
+
+
+def _iter_schedule_occurrences(
+    *,
+    weekday: int,
+    starts_on: date,
+    ends_on: date | None,
+    window_start_date: date,
+    window_end_date: date,
+):
+    effective_start = max(starts_on, window_start_date)
+    effective_end = min(ends_on or window_end_date, window_end_date)
+
+    if effective_start > effective_end:
+        return
+
+    offset = (weekday - effective_start.isoweekday()) % 7
+    current = effective_start + timedelta(days=offset)
+
+    while current <= effective_end:
+        yield current
+        current += timedelta(days=7)
+
+
+def _sync_group_lesson_events(db: Session, group_id: UUID, user_id: str) -> None:
+    window_start, window_end, window_start_date, window_end_date = _group_lesson_window()
+    tz = _local_tz()
+
+    db.execute(
+        text(
+            """
+            DELETE FROM public.events
+            WHERE class_group_id = :group_id
+              AND kind = 'group_lesson'
+              AND start_at >= :window_start
+              AND start_at <= :window_end
+            """
+        ),
+        {
+            "group_id": group_id,
+            "window_start": window_start,
+            "window_end": window_end,
+        },
+    )
+
+    group = _get_class_group_or_404(db, group_id)
+
+    if not group["is_active"]:
+        return
+
+    if group["teacher_id"] is None or group["court_id"] is None:
+        return
+
+    schedules = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  class_group_id,
+                  weekday,
+                  start_time,
+                  end_time,
+                  starts_on,
+                  ends_on,
+                  is_active,
+                  notes
+                FROM public.class_group_schedules
+                WHERE class_group_id = :group_id
+                  AND is_active = TRUE
+                  AND starts_on <= :window_end_date
+                  AND (
+                    ends_on IS NULL
+                    OR ends_on >= :window_start_date
+                  )
+                ORDER BY
+                  weekday,
+                  start_time,
+                  starts_on,
+                  id
+                """
+            ),
+            {
+                "group_id": group_id,
+                "window_start_date": window_start_date,
+                "window_end_date": window_end_date,
+            },
+        )
+        .mappings()
+        .all()
+    )
+
+    if not schedules:
+        return
+
+    created_by_uuid = UUID(user_id)
+
+    for schedule in schedules:
+        event_notes = schedule["notes"] if schedule["notes"] is not None else group["notes"]
+
+        for occurrence_date in _iter_schedule_occurrences(
+            weekday=int(schedule["weekday"]),
+            starts_on=schedule["starts_on"],
+            ends_on=schedule["ends_on"],
+            window_start_date=window_start_date,
+            window_end_date=window_end_date,
+        ):
+            start_at = datetime.combine(occurrence_date, schedule["start_time"], tzinfo=tz)
+            end_at = datetime.combine(occurrence_date, schedule["end_time"], tzinfo=tz)
+
+            if start_at < window_start or start_at > window_end:
+                continue
+
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.events (
+                      court_id,
+                      teacher_id,
+                      student_id,
+                      created_by,
+                      class_group_id,
+                      kind,
+                      status,
+                      start_at,
+                      end_at,
+                      notes
+                    )
+                    VALUES (
+                      :court_id,
+                      :teacher_id,
+                      NULL,
+                      :created_by,
+                      :class_group_id,
+                      'group_lesson',
+                      'confirmado',
+                      :start_at,
+                      :end_at,
+                      :notes
+                    )
+                    """
+                ),
+                {
+                    "court_id": group["court_id"],
+                    "teacher_id": group["teacher_id"],
+                    "created_by": created_by_uuid,
+                    "class_group_id": group_id,
+                    "start_at": start_at,
+                    "end_at": end_at,
+                    "notes": event_notes,
+                },
+            )
 
 
 def _get_class_group_or_404(db: Session, group_id: UUID):
@@ -377,6 +565,7 @@ def create_class_group(
             .mappings()
             .first()
         )
+        _sync_group_lesson_events(db, row["id"], user_id)
         db.commit()
         return row
 
@@ -447,6 +636,7 @@ def update_class_group(
             .mappings()
             .first()
         )
+        _sync_group_lesson_events(db, group_id, user_id)
         db.commit()
         return row
 
@@ -464,35 +654,41 @@ def deactivate_class_group(
     _require_admin(db, user_id)
     _get_class_group_or_404(db, group_id)
 
-    row = (
-        db.execute(
-            text(
-                """
-                UPDATE public.class_groups
-                SET
-                  is_active = FALSE,
-                  updated_at = now()
-                WHERE id = :group_id
-                RETURNING
-                  id,
-                  name,
-                  level,
-                  teacher_id,
-                  court_id,
-                  capacity,
-                  is_active,
-                  notes,
-                  created_at,
-                  updated_at
-                """
-            ),
-            {"group_id": group_id},
+    try:
+        row = (
+            db.execute(
+                text(
+                    """
+                    UPDATE public.class_groups
+                    SET
+                      is_active = FALSE,
+                      updated_at = now()
+                    WHERE id = :group_id
+                    RETURNING
+                      id,
+                      name,
+                      level,
+                      teacher_id,
+                      court_id,
+                      capacity,
+                      is_active,
+                      notes,
+                      created_at,
+                      updated_at
+                    """
+                ),
+                {"group_id": group_id},
+            )
+            .mappings()
+            .first()
         )
-        .mappings()
-        .first()
-    )
-    db.commit()
-    return row
+        _sync_group_lesson_events(db, group_id, user_id)
+        db.commit()
+        return row
+
+    except IntegrityError as e:
+        db.rollback()
+        raise _integrity_to_http(e) from e
 
 
 @router.get("/{group_id}/schedules", response_model=list[ClassGroupScheduleOut])
@@ -603,6 +799,7 @@ def create_class_group_schedule(
             .mappings()
             .first()
         )
+        _sync_group_lesson_events(db, group_id, user_id)
         db.commit()
         return row
 
@@ -689,6 +886,7 @@ def update_class_group_schedule(
             .mappings()
             .first()
         )
+        _sync_group_lesson_events(db, group_id, user_id)
         db.commit()
         return row
 
@@ -711,37 +909,43 @@ def deactivate_class_group_schedule(
     _get_class_group_or_404(db, group_id)
     _get_class_group_schedule_or_404(db, group_id, schedule_id)
 
-    row = (
-        db.execute(
-            text(
-                """
-                UPDATE public.class_group_schedules
-                SET
-                  is_active = FALSE,
-                  updated_at = now()
-                WHERE id = :schedule_id
-                  AND class_group_id = :group_id
-                RETURNING
-                  id,
-                  class_group_id,
-                  weekday,
-                  start_time,
-                  end_time,
-                  starts_on,
-                  ends_on,
-                  is_active,
-                  notes,
-                  created_at,
-                  updated_at
-                """
-            ),
-            {"schedule_id": schedule_id, "group_id": group_id},
+    try:
+        row = (
+            db.execute(
+                text(
+                    """
+                    UPDATE public.class_group_schedules
+                    SET
+                      is_active = FALSE,
+                      updated_at = now()
+                    WHERE id = :schedule_id
+                      AND class_group_id = :group_id
+                    RETURNING
+                      id,
+                      class_group_id,
+                      weekday,
+                      start_time,
+                      end_time,
+                      starts_on,
+                      ends_on,
+                      is_active,
+                      notes,
+                      created_at,
+                      updated_at
+                    """
+                ),
+                {"schedule_id": schedule_id, "group_id": group_id},
+            )
+            .mappings()
+            .first()
         )
-        .mappings()
-        .first()
-    )
-    db.commit()
-    return row
+        _sync_group_lesson_events(db, group_id, user_id)
+        db.commit()
+        return row
+
+    except IntegrityError as e:
+        db.rollback()
+        raise _integrity_to_http(e) from e
 
 
 @router.get("/{group_id}/enrollments", response_model=list[ClassGroupEnrollmentListItemOut])
