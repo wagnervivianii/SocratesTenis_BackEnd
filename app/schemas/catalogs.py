@@ -27,8 +27,24 @@ class CatalogTeacherOut(BaseModel):
     is_active: bool
 
 
+class CatalogStudentOut(BaseModel):
+    id: UUID
+    full_name: str
+    email: str | None = None
+    phone: str | None = None
+    is_active: bool
+
+
 class BookableSlotCatalogsOut(BaseModel):
     modalities: list[CatalogOptionOut]
     weekdays: list[CatalogWeekdayOptionOut]
     courts: list[CatalogCourtOut]
     teachers: list[CatalogTeacherOut]
+
+
+class ClassGroupCatalogsOut(BaseModel):
+    levels: list[CatalogOptionOut]
+    weekdays: list[CatalogWeekdayOptionOut]
+    courts: list[CatalogCourtOut]
+    teachers: list[CatalogTeacherOut]
+    students: list[CatalogStudentOut]
