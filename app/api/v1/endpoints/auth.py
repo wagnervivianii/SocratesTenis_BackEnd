@@ -121,6 +121,14 @@ class ResendVerificationIn(BaseModel):
     email: EmailStr
 
 
+class MeOut(BaseModel):
+    user_id: str
+    email: EmailStr
+    full_name: str | None = None
+    role: str
+    is_active: bool
+
+
 @router.post("/login", response_model=TokenOut)
 def login(data: LoginIn, response: Response, db: DBSession):
     user = db.scalar(select(User).where(User.email == str(data.email)))
@@ -371,9 +379,23 @@ def logout(response: Response):
     return MessageOut(message="ok")
 
 
-@router.get("/me")
-def me(user_id: str = Depends(get_current_user_id)):
-    return {"user_id": user_id}
+@router.get("/me", response_model=MeOut)
+def me(user_id: str = Depends(get_current_user_id), db: DBSession = None):
+    user = db.get(User, UUID(user_id))
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuário não encontrado",
+        )
+
+    return MeOut(
+        user_id=str(user.id),
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role,
+        is_active=user.is_active,
+    )
 
 
 @router.get("/verify-email")
