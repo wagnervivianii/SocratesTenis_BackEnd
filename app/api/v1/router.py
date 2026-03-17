@@ -8,6 +8,7 @@ from app.api.v1.endpoints.class_groups import router as class_groups_router
 from app.api.v1.endpoints.disponibilidade import router as disponibilidade_router
 from app.api.v1.endpoints.events import router as events_router
 from app.api.v1.endpoints.health import router as health_router
+from app.api.v1.endpoints.teachers import router as teachers_router
 from app.api.v1.endpoints.trial_lessons import router as trial_lessons_router
 from app.routes.shorts import router as shorts_router
 
@@ -43,6 +44,9 @@ api_router.include_router(catalogs_router, tags=["catalogs"])
 
 # Class Groups -> /api/v1/class-groups/...
 api_router.include_router(class_groups_router, tags=["class-groups"])
+
+# Teachers -> /api/v1/teachers/...
+api_router.include_router(teachers_router, tags=["teachers"])
 
 # Shorts (YouTube) -> /api/v1/shorts/...
 api_router.include_router(shorts_router, tags=["shorts"])
