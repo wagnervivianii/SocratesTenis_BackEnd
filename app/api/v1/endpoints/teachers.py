@@ -14,6 +14,7 @@ from app.schemas.teachers import (
     TeacherCreateIn,
     TeacherListItemOut,
     TeacherOut,
+    TeacherStatusChangeIn,
     TeacherUpdateIn,
 )
 
@@ -123,6 +124,44 @@ def _get_teacher_or_404(db: Session, teacher_id: UUID):
         )
 
     return row
+
+
+def _insert_teacher_status_history(
+    db: Session,
+    *,
+    teacher_id: UUID,
+    status_value: str,
+    changed_by_user_id: str,
+    reason_code: str | None = None,
+    reason_note: str | None = None,
+) -> None:
+    db.execute(
+        text(
+            """
+            INSERT INTO public.teacher_status_history (
+              teacher_id,
+              status,
+              reason_code,
+              reason_note,
+              changed_by_user_id
+            )
+            VALUES (
+              :teacher_id,
+              :status,
+              :reason_code,
+              :reason_note,
+              :changed_by_user_id
+            )
+            """
+        ),
+        {
+            "teacher_id": teacher_id,
+            "status": status_value,
+            "reason_code": reason_code.strip() if reason_code else None,
+            "reason_note": reason_note.strip() if reason_note else None,
+            "changed_by_user_id": changed_by_user_id,
+        },
+    )
 
 
 @router.get("/", response_model=list[TeacherListItemOut])
@@ -236,6 +275,16 @@ def create_teacher(
             .mappings()
             .first()
         )
+
+        _insert_teacher_status_history(
+            db,
+            teacher_id=row["id"],
+            status_value="active" if row["is_active"] else "inactive",
+            changed_by_user_id=user_id,
+            reason_code="created",
+            reason_note="Cadastro inicial do professor.",
+        )
+
         db.commit()
         return row
 
@@ -310,11 +359,15 @@ def update_teacher(
 @router.patch("/{teacher_id}/deactivate", response_model=TeacherOut)
 def deactivate_teacher(
     teacher_id: UUID,
+    payload: TeacherStatusChangeIn | None,
     db: Annotated[Session, Depends(get_db)],
     user_id: Annotated[str, Depends(get_current_user_id)],
 ):
     _require_admin(db, user_id)
-    _get_teacher_or_404(db, teacher_id)
+    current = _get_teacher_or_404(db, teacher_id)
+
+    if not current["is_active"]:
+        return current
 
     row = (
         db.execute(
@@ -342,5 +395,68 @@ def deactivate_teacher(
         .mappings()
         .first()
     )
+
+    _insert_teacher_status_history(
+        db,
+        teacher_id=teacher_id,
+        status_value="inactive",
+        changed_by_user_id=user_id,
+        reason_code=payload.reason_code if payload else None,
+        reason_note=payload.reason_note if payload else None,
+    )
+
+    db.commit()
+    return row
+
+
+@router.patch("/{teacher_id}/reactivate", response_model=TeacherOut)
+def reactivate_teacher(
+    teacher_id: UUID,
+    payload: TeacherStatusChangeIn | None,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    current = _get_teacher_or_404(db, teacher_id)
+
+    if current["is_active"]:
+        return current
+
+    row = (
+        db.execute(
+            text(
+                """
+                UPDATE public.teachers
+                SET
+                  is_active = TRUE,
+                  updated_at = now()
+                WHERE id = :teacher_id
+                RETURNING
+                  id,
+                  user_id,
+                  full_name,
+                  email,
+                  phone,
+                  notes,
+                  is_active,
+                  created_at,
+                  updated_at
+                """
+            ),
+            {"teacher_id": teacher_id},
+        )
+        .mappings()
+        .first()
+    )
+
+    _insert_teacher_status_history(
+        db,
+        teacher_id=teacher_id,
+        status_value="active",
+        changed_by_user_id=user_id,
+        reason_code=payload.reason_code if payload else None,
+        reason_note=payload.reason_note if payload else None,
+    )
+
     db.commit()
     return row

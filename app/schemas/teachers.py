@@ -22,6 +22,11 @@ class TeacherUpdateIn(BaseModel):
     is_active: bool | None = None
 
 
+class TeacherStatusChangeIn(BaseModel):
+    reason_code: str | None = Field(default=None, max_length=60)
+    reason_note: str | None = Field(default=None, max_length=1000)
+
+
 class TeacherOut(BaseModel):
     id: UUID
     user_id: UUID | None = None
