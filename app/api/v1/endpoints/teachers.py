@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import date, datetime, time, timedelta
 from typing import Annotated
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
@@ -11,14 +13,20 @@ from sqlalchemy.orm import Session
 from app.api.v1.deps import get_current_user_id
 from app.db.session import get_db
 from app.schemas.teachers import (
+    TeacherAgendaWeekItemOut,
+    TeacherAvailabilityExceptionOut,
+    TeacherAvailabilityRuleOut,
     TeacherCreateIn,
     TeacherListItemOut,
     TeacherOut,
     TeacherStatusChangeIn,
+    TeacherStatusHistoryItemOut,
     TeacherUpdateIn,
 )
 
 router = APIRouter(prefix="/teachers")
+
+BRAZIL_TZ = ZoneInfo("America/Sao_Paulo")
 
 
 def _get_current_user_row(db: Session, user_id: str):
@@ -223,6 +231,200 @@ def get_teacher(
 ):
     _require_admin(db, user_id)
     return _get_teacher_or_404(db, teacher_id)
+
+
+@router.get("/{teacher_id}/status-history", response_model=list[TeacherStatusHistoryItemOut])
+def get_teacher_status_history(
+    teacher_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    _get_teacher_or_404(db, teacher_id)
+
+    rows = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  teacher_id,
+                  status,
+                  reason_code,
+                  reason_note,
+                  changed_by_user_id,
+                  created_at
+                FROM public.teacher_status_history
+                WHERE teacher_id = :teacher_id
+                ORDER BY created_at DESC, id DESC
+                """
+            ),
+            {"teacher_id": teacher_id},
+        )
+        .mappings()
+        .all()
+    )
+
+    return rows
+
+
+@router.get("/{teacher_id}/availability-rules", response_model=list[TeacherAvailabilityRuleOut])
+def get_teacher_availability_rules(
+    teacher_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    _get_teacher_or_404(db, teacher_id)
+
+    rows = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  teacher_id,
+                  weekday,
+                  start_time,
+                  end_time,
+                  starts_on,
+                  ends_on,
+                  modality,
+                  court_id,
+                  is_active,
+                  notes,
+                  created_at,
+                  updated_at
+                FROM public.teacher_availability_rules
+                WHERE teacher_id = :teacher_id
+                ORDER BY
+                  is_active DESC,
+                  weekday,
+                  start_time,
+                  starts_on,
+                  id
+                """
+            ),
+            {"teacher_id": teacher_id},
+        )
+        .mappings()
+        .all()
+    )
+
+    return rows
+
+
+@router.get(
+    "/{teacher_id}/availability-exceptions",
+    response_model=list[TeacherAvailabilityExceptionOut],
+)
+def get_teacher_availability_exceptions(
+    teacher_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    _get_teacher_or_404(db, teacher_id)
+
+    rows = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  teacher_id,
+                  start_at,
+                  end_at,
+                  exception_type,
+                  modality,
+                  court_id,
+                  is_active,
+                  reason,
+                  created_at,
+                  updated_at
+                FROM public.teacher_availability_exceptions
+                WHERE teacher_id = :teacher_id
+                ORDER BY
+                  is_active DESC,
+                  start_at DESC,
+                  end_at DESC,
+                  id DESC
+                """
+            ),
+            {"teacher_id": teacher_id},
+        )
+        .mappings()
+        .all()
+    )
+
+    return rows
+
+
+@router.get("/{teacher_id}/agenda-week", response_model=list[TeacherAgendaWeekItemOut])
+def get_teacher_agenda_week(
+    teacher_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    date_from: Annotated[
+        date | None,
+        Query(description="Data inicial da janela semanal no formato YYYY-MM-DD"),
+    ] = None,
+):
+    _require_admin(db, user_id)
+    _get_teacher_or_404(db, teacher_id)
+
+    reference_date = date_from or datetime.now(BRAZIL_TZ).date()
+    window_start = datetime.combine(reference_date, time.min, tzinfo=BRAZIL_TZ)
+    window_end = window_start + timedelta(days=7)
+
+    rows = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  ev.id AS event_id,
+                  ev.kind,
+                  ev.status,
+                  ev.start_at,
+                  ev.end_at,
+                  ev.notes,
+                  ev.court_id,
+                  c.name AS court_name,
+                  ev.teacher_id,
+                  t.full_name AS teacher_name,
+                  ev.student_id,
+                  s.full_name AS student_name,
+                  ev.class_group_id,
+                  cg.name AS class_group_name
+                FROM public.events ev
+                LEFT JOIN public.courts c
+                  ON c.id = ev.court_id
+                LEFT JOIN public.teachers t
+                  ON t.id = ev.teacher_id
+                LEFT JOIN public.students s
+                  ON s.id = ev.student_id
+                LEFT JOIN public.class_groups cg
+                  ON cg.id = ev.class_group_id
+                WHERE ev.teacher_id = :teacher_id
+                  AND ev.start_at < :window_end
+                  AND ev.end_at >= :window_start
+                ORDER BY
+                  ev.start_at,
+                  ev.end_at,
+                  ev.id
+                """
+            ),
+            {
+                "teacher_id": teacher_id,
+                "window_start": window_start,
+                "window_end": window_end,
+            },
+        )
+        .mappings()
+        .all()
+    )
+
+    return rows
 
 
 @router.post("/", response_model=TeacherOut, status_code=status.HTTP_201_CREATED)
