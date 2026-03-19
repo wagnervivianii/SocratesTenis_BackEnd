@@ -188,6 +188,182 @@ def _iter_schedule_occurrences(
         current += timedelta(days=7)
 
 
+def _resolve_group_teacher_id_for_date(
+    db: Session,
+    *,
+    group_id: UUID,
+    target_date: date,
+) -> UUID | None:
+    assignment = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  teacher_id
+                FROM public.class_group_teacher_assignments
+                WHERE class_group_id = :group_id
+                  AND is_active = TRUE
+                  AND starts_on <= :target_date
+                  AND (
+                    ends_on IS NULL
+                    OR ends_on >= :target_date
+                  )
+                ORDER BY
+                  starts_on DESC,
+                  created_at DESC,
+                  id DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "group_id": group_id,
+                "target_date": target_date,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+    if assignment:
+        return assignment["teacher_id"]
+
+    legacy = (
+        db.execute(
+            text(
+                """
+                SELECT teacher_id
+                FROM public.class_groups
+                WHERE id = :group_id
+                """
+            ),
+            {"group_id": group_id},
+        )
+        .mappings()
+        .first()
+    )
+
+    if legacy:
+        return legacy["teacher_id"]
+
+    return None
+
+
+def _sync_group_teacher_assignments_from_legacy_teacher_id(
+    db: Session,
+    *,
+    group_id: UUID,
+    teacher_id: UUID | None,
+) -> None:
+    if teacher_id is None:
+        return
+
+    today = datetime.now(_local_tz()).date()
+    yesterday = today - timedelta(days=1)
+
+    current_assignment = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  teacher_id,
+                  starts_on,
+                  ends_on
+                FROM public.class_group_teacher_assignments
+                WHERE class_group_id = :group_id
+                  AND is_active = TRUE
+                  AND starts_on <= :today
+                  AND (
+                    ends_on IS NULL
+                    OR ends_on >= :today
+                  )
+                ORDER BY
+                  starts_on DESC,
+                  created_at DESC,
+                  id DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "group_id": group_id,
+                "today": today,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+    if current_assignment and current_assignment["teacher_id"] == teacher_id:
+        return
+
+    db.execute(
+        text(
+            """
+            DELETE FROM public.class_group_teacher_assignments
+            WHERE class_group_id = :group_id
+              AND is_active = TRUE
+              AND starts_on >= :today
+            """
+        ),
+        {
+            "group_id": group_id,
+            "today": today,
+        },
+    )
+
+    db.execute(
+        text(
+            """
+            UPDATE public.class_group_teacher_assignments
+            SET
+              ends_on = :yesterday,
+              is_active = FALSE,
+              updated_at = now()
+            WHERE class_group_id = :group_id
+              AND is_active = TRUE
+              AND starts_on < :today
+              AND (
+                ends_on IS NULL
+                OR ends_on >= :today
+              )
+            """
+        ),
+        {
+            "group_id": group_id,
+            "today": today,
+            "yesterday": yesterday,
+        },
+    )
+
+    db.execute(
+        text(
+            """
+            INSERT INTO public.class_group_teacher_assignments (
+              class_group_id,
+              teacher_id,
+              starts_on,
+              ends_on,
+              is_active,
+              notes
+            )
+            VALUES (
+              :group_id,
+              :teacher_id,
+              :today,
+              NULL,
+              TRUE,
+              'Sincronizado automaticamente a partir de class_groups.teacher_id'
+            )
+            """
+        ),
+        {
+            "group_id": group_id,
+            "teacher_id": teacher_id,
+            "today": today,
+        },
+    )
+
+
 def _sync_group_lesson_events(db: Session, group_id: UUID, user_id: str) -> None:
     window_start, window_end, window_start_date, window_end_date = _group_lesson_window()
     tz = _local_tz()
@@ -214,7 +390,7 @@ def _sync_group_lesson_events(db: Session, group_id: UUID, user_id: str) -> None
     if not group["is_active"]:
         return
 
-    if group["teacher_id"] is None or group["court_id"] is None:
+    if group["court_id"] is None:
         return
 
     schedules = (
@@ -277,6 +453,15 @@ def _sync_group_lesson_events(db: Session, group_id: UUID, user_id: str) -> None
             if start_at < window_start or start_at > window_end:
                 continue
 
+            teacher_id = _resolve_group_teacher_id_for_date(
+                db,
+                group_id=group_id,
+                target_date=occurrence_date,
+            )
+
+            if teacher_id is None:
+                continue
+
             db.execute(
                 text(
                     """
@@ -308,7 +493,7 @@ def _sync_group_lesson_events(db: Session, group_id: UUID, user_id: str) -> None
                 ),
                 {
                     "court_id": group["court_id"],
-                    "teacher_id": group["teacher_id"],
+                    "teacher_id": teacher_id,
                     "created_by": created_by_uuid,
                     "class_group_id": group_id,
                     "start_at": start_at,
@@ -565,6 +750,11 @@ def create_class_group(
             .mappings()
             .first()
         )
+        _sync_group_teacher_assignments_from_legacy_teacher_id(
+            db,
+            group_id=row["id"],
+            teacher_id=row["teacher_id"],
+        )
         _sync_group_lesson_events(db, row["id"], user_id)
         db.commit()
         return row
@@ -635,6 +825,11 @@ def update_class_group(
             )
             .mappings()
             .first()
+        )
+        _sync_group_teacher_assignments_from_legacy_teacher_id(
+            db,
+            group_id=group_id,
+            teacher_id=row["teacher_id"],
         )
         _sync_group_lesson_events(db, group_id, user_id)
         db.commit()
