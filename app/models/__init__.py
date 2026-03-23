@@ -6,6 +6,7 @@ from app.models.class_group_teacher_assignment import ClassGroupTeacherAssignmen
 from app.models.court import Court  # noqa: F401
 from app.models.event import Event  # noqa: F401
 from app.models.student import Student  # noqa: F401
+from app.models.student_status_history import StudentStatusHistory  # noqa: F401
 from app.models.teacher import Teacher  # noqa: F401
 from app.models.teacher_availability_exception import TeacherAvailabilityException  # noqa: F401
 from app.models.teacher_availability_rule import TeacherAvailabilityRule  # noqa: F401
