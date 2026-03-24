@@ -78,7 +78,12 @@ class ClassGroupScheduleCreateIn(BaseModel):
 
 
 class ClassGroupScheduleUpdateIn(BaseModel):
-    weekday: int | None = Field(default=None, ge=1, le=7, description="1=segunda ... 7=domingo")
+    weekday: int | None = Field(
+        default=None,
+        ge=1,
+        le=7,
+        description="1=segunda ... 7=domingo",
+    )
     start_time: time | None = None
     end_time: time | None = None
     starts_on: date | None = None
@@ -114,6 +119,11 @@ class ClassGroupEnrollmentUpdateIn(BaseModel):
     ends_on: date | None = None
 
 
+class ClassGroupEnrollmentStatusChangeIn(BaseModel):
+    reason_code: str | None = Field(default=None, max_length=60)
+    reason_note: str | None = Field(default=None, max_length=1000)
+
+
 class ClassGroupEnrollmentOut(BaseModel):
     id: UUID
     class_group_id: UUID
@@ -129,3 +139,13 @@ class ClassGroupEnrollmentListItemOut(ClassGroupEnrollmentOut):
     student_name: str
     student_email: str | None = None
     student_phone: str | None = None
+
+
+class ClassGroupEnrollmentStatusHistoryItemOut(BaseModel):
+    id: UUID
+    class_group_enrollment_id: UUID
+    status: str
+    reason_code: str | None = None
+    reason_note: str | None = None
+    changed_by_user_id: UUID | None = None
+    created_at: datetime

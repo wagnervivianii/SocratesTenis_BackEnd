@@ -17,6 +17,8 @@ from app.schemas.class_groups import (
     ClassGroupEnrollmentCreateIn,
     ClassGroupEnrollmentListItemOut,
     ClassGroupEnrollmentOut,
+    ClassGroupEnrollmentStatusChangeIn,
+    ClassGroupEnrollmentStatusHistoryItemOut,
     ClassGroupEnrollmentUpdateIn,
     ClassGroupListItemOut,
     ClassGroupOut,
@@ -124,6 +126,24 @@ def _validate_status_change_payload(
     return reason_code, reason_note
 
 
+def _validate_enrollment_status_change_payload(
+    payload: ClassGroupEnrollmentStatusChangeIn | None,
+) -> tuple[str | None, str | None]:
+    if payload is None:
+        return None, None
+
+    reason_code = payload.reason_code.strip() if payload.reason_code else None
+    reason_note = payload.reason_note.strip() if payload.reason_note else None
+
+    if reason_code == "other" and not reason_note:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe o motivo complementar quando o motivo for 'other'.",
+        )
+
+    return reason_code, reason_note
+
+
 def _insert_class_group_status_history(
     db: Session,
     *,
@@ -160,6 +180,78 @@ def _insert_class_group_status_history(
             "changed_by_user_id": changed_by_user_id,
         },
     )
+
+
+def _insert_class_group_enrollment_status_history(
+    db: Session,
+    *,
+    enrollment_id: UUID,
+    status_value: str,
+    changed_by_user_id: str,
+    reason_code: str | None = None,
+    reason_note: str | None = None,
+) -> None:
+    db.execute(
+        text(
+            """
+            INSERT INTO public.class_group_enrollment_status_history (
+              class_group_enrollment_id,
+              status,
+              reason_code,
+              reason_note,
+              changed_by_user_id
+            )
+            VALUES (
+              :class_group_enrollment_id,
+              :status,
+              :reason_code,
+              :reason_note,
+              :changed_by_user_id
+            )
+            """
+        ),
+        {
+            "class_group_enrollment_id": enrollment_id,
+            "status": status_value,
+            "reason_code": reason_code,
+            "reason_note": reason_note,
+            "changed_by_user_id": changed_by_user_id,
+        },
+    )
+
+
+def _ensure_group_has_capacity_for_active_enrollment(
+    db: Session,
+    *,
+    group_id: UUID,
+    capacity: int,
+    ignore_enrollment_id: UUID | None = None,
+) -> None:
+    sql = """
+        SELECT COUNT(*) AS total
+        FROM public.class_group_enrollments
+        WHERE class_group_id = :group_id
+          AND status = 'active'
+          AND (
+            ends_on IS NULL
+            OR ends_on >= CURRENT_DATE
+          )
+    """
+
+    params: dict[str, object] = {"group_id": group_id}
+
+    if ignore_enrollment_id is not None:
+        sql += " AND id <> :ignore_enrollment_id"
+        params["ignore_enrollment_id"] = ignore_enrollment_id
+
+    row = db.execute(text(sql), params).mappings().first()
+    current_total = int(row["total"]) if row else 0
+
+    if current_total >= int(capacity):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A turma já atingiu sua capacidade máxima.",
+        )
 
 
 def _integrity_to_http(e: IntegrityError) -> HTTPException:
@@ -1401,31 +1493,11 @@ def create_class_group_enrollment(
     group = _get_class_group_or_404(db, group_id)
     _validate_enrollment_payload(payload)
 
-    active_enrollments = (
-        db.execute(
-            text(
-                """
-            SELECT COUNT(*) AS total
-            FROM public.class_group_enrollments
-            WHERE class_group_id = :group_id
-              AND status = 'active'
-              AND (
-                ends_on IS NULL
-                OR ends_on >= CURRENT_DATE
-              )
-            """
-            ),
-            {"group_id": group_id},
-        )
-        .mappings()
-        .first()
-    )
-
-    current_total = int(active_enrollments["total"]) if active_enrollments else 0
-    if current_total >= int(group["capacity"]):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A turma já atingiu sua capacidade máxima.",
+    if payload.status == "active":
+        _ensure_group_has_capacity_for_active_enrollment(
+            db,
+            group_id=group_id,
+            capacity=int(group["capacity"]),
         )
 
     try:
@@ -1469,6 +1541,14 @@ def create_class_group_enrollment(
             .mappings()
             .first()
         )
+        _insert_class_group_enrollment_status_history(
+            db,
+            enrollment_id=row["id"],
+            status_value=row["status"],
+            changed_by_user_id=user_id,
+            reason_code="created",
+            reason_note="Cadastro inicial da matrícula da turma.",
+        )
         db.commit()
         return row
 
@@ -1491,6 +1571,46 @@ def get_class_group_enrollment(
     return _get_class_group_enrollment_or_404(db, group_id, enrollment_id)
 
 
+@router.get(
+    "/{group_id}/enrollments/{enrollment_id}/status-history",
+    response_model=list[ClassGroupEnrollmentStatusHistoryItemOut],
+)
+def get_class_group_enrollment_status_history(
+    group_id: UUID,
+    enrollment_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    _get_class_group_or_404(db, group_id)
+    _get_class_group_enrollment_or_404(db, group_id, enrollment_id)
+
+    rows = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  class_group_enrollment_id,
+                  status,
+                  reason_code,
+                  reason_note,
+                  changed_by_user_id,
+                  created_at
+                FROM public.class_group_enrollment_status_history
+                WHERE class_group_enrollment_id = :enrollment_id
+                ORDER BY created_at DESC, id DESC
+                """
+            ),
+            {"enrollment_id": enrollment_id},
+        )
+        .mappings()
+        .all()
+    )
+
+    return rows
+
+
 @router.patch(
     "/{group_id}/enrollments/{enrollment_id}",
     response_model=ClassGroupEnrollmentOut,
@@ -1507,8 +1627,17 @@ def update_class_group_enrollment(
 
     current = _get_class_group_enrollment_or_404(db, group_id, enrollment_id)
 
+    if payload.status is not None and payload.status != current["status"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Use os endpoints específicos de inativação/reativação/cancelamento "
+                "da matrícula para alterar o status."
+            ),
+        )
+
     merged = {
-        "status": payload.status if payload.status is not None else current["status"],
+        "status": current["status"],
         "starts_on": payload.starts_on if payload.starts_on is not None else current["starts_on"],
         "ends_on": payload.ends_on if payload.ends_on is not None else current["ends_on"],
     }
@@ -1559,18 +1688,161 @@ def update_class_group_enrollment(
 
 
 @router.patch(
+    "/{group_id}/enrollments/{enrollment_id}/deactivate",
+    response_model=ClassGroupEnrollmentOut,
+)
+def deactivate_class_group_enrollment(
+    group_id: UUID,
+    enrollment_id: UUID,
+    payload: ClassGroupEnrollmentStatusChangeIn | None,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    _get_class_group_or_404(db, group_id)
+    current = _get_class_group_enrollment_or_404(db, group_id, enrollment_id)
+
+    if current["status"] == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A matrícula cancelada não pode ser inativada.",
+        )
+
+    if current["status"] == "inactive":
+        return current
+
+    reason_code, reason_note = _validate_enrollment_status_change_payload(payload)
+
+    row = (
+        db.execute(
+            text(
+                """
+                UPDATE public.class_group_enrollments
+                SET
+                  status = 'inactive',
+                  updated_at = now()
+                WHERE id = :enrollment_id
+                  AND class_group_id = :group_id
+                RETURNING
+                  id,
+                  class_group_id,
+                  student_id,
+                  status,
+                  starts_on,
+                  ends_on,
+                  created_at,
+                  updated_at
+                """
+            ),
+            {"enrollment_id": enrollment_id, "group_id": group_id},
+        )
+        .mappings()
+        .first()
+    )
+
+    _insert_class_group_enrollment_status_history(
+        db,
+        enrollment_id=enrollment_id,
+        status_value="inactive",
+        changed_by_user_id=user_id,
+        reason_code=reason_code,
+        reason_note=reason_note,
+    )
+    db.commit()
+    return row
+
+
+@router.patch(
+    "/{group_id}/enrollments/{enrollment_id}/reactivate",
+    response_model=ClassGroupEnrollmentOut,
+)
+def reactivate_class_group_enrollment(
+    group_id: UUID,
+    enrollment_id: UUID,
+    payload: ClassGroupEnrollmentStatusChangeIn | None,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    group = _get_class_group_or_404(db, group_id)
+    current = _get_class_group_enrollment_or_404(db, group_id, enrollment_id)
+
+    if current["status"] == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A matrícula cancelada não pode ser reativada.",
+        )
+
+    if current["status"] == "active":
+        return current
+
+    reason_code, reason_note = _validate_enrollment_status_change_payload(payload)
+
+    _ensure_group_has_capacity_for_active_enrollment(
+        db,
+        group_id=group_id,
+        capacity=int(group["capacity"]),
+        ignore_enrollment_id=enrollment_id,
+    )
+
+    row = (
+        db.execute(
+            text(
+                """
+                UPDATE public.class_group_enrollments
+                SET
+                  status = 'active',
+                  updated_at = now()
+                WHERE id = :enrollment_id
+                  AND class_group_id = :group_id
+                RETURNING
+                  id,
+                  class_group_id,
+                  student_id,
+                  status,
+                  starts_on,
+                  ends_on,
+                  created_at,
+                  updated_at
+                """
+            ),
+            {"enrollment_id": enrollment_id, "group_id": group_id},
+        )
+        .mappings()
+        .first()
+    )
+
+    _insert_class_group_enrollment_status_history(
+        db,
+        enrollment_id=enrollment_id,
+        status_value="active",
+        changed_by_user_id=user_id,
+        reason_code=reason_code,
+        reason_note=reason_note,
+    )
+    db.commit()
+    return row
+
+
+@router.patch(
     "/{group_id}/enrollments/{enrollment_id}/cancel",
     response_model=ClassGroupEnrollmentOut,
 )
 def cancel_class_group_enrollment(
     group_id: UUID,
     enrollment_id: UUID,
+    payload: ClassGroupEnrollmentStatusChangeIn | None,
     db: Annotated[Session, Depends(get_db)],
     user_id: Annotated[str, Depends(get_current_user_id)],
 ):
     _require_admin(db, user_id)
     _get_class_group_or_404(db, group_id)
-    _get_class_group_enrollment_or_404(db, group_id, enrollment_id)
+    current = _get_class_group_enrollment_or_404(db, group_id, enrollment_id)
+
+    if current["status"] == "cancelled":
+        return current
+
+    reason_code, reason_note = _validate_enrollment_status_change_payload(payload)
 
     row = (
         db.execute(
@@ -1597,6 +1869,15 @@ def cancel_class_group_enrollment(
         )
         .mappings()
         .first()
+    )
+
+    _insert_class_group_enrollment_status_history(
+        db,
+        enrollment_id=enrollment_id,
+        status_value="cancelled",
+        changed_by_user_id=user_id,
+        reason_code=reason_code,
+        reason_note=reason_note,
     )
     db.commit()
     return row
