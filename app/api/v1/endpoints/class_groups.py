@@ -23,6 +23,8 @@ from app.schemas.class_groups import (
     ClassGroupScheduleCreateIn,
     ClassGroupScheduleOut,
     ClassGroupScheduleUpdateIn,
+    ClassGroupStatusChangeIn,
+    ClassGroupStatusHistoryItemOut,
     ClassGroupUpdateIn,
 )
 
@@ -102,6 +104,62 @@ def _validate_enrollment_payload(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="ends_on não pode ser menor que starts_on",
         )
+
+
+def _validate_status_change_payload(
+    payload: ClassGroupStatusChangeIn | None,
+) -> tuple[str | None, str | None]:
+    if payload is None:
+        return None, None
+
+    reason_code = payload.reason_code.strip() if payload.reason_code else None
+    reason_note = payload.reason_note.strip() if payload.reason_note else None
+
+    if reason_code == "other" and not reason_note:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe o motivo complementar quando o motivo for 'other'.",
+        )
+
+    return reason_code, reason_note
+
+
+def _insert_class_group_status_history(
+    db: Session,
+    *,
+    group_id: UUID,
+    status_value: str,
+    changed_by_user_id: str,
+    reason_code: str | None = None,
+    reason_note: str | None = None,
+) -> None:
+    db.execute(
+        text(
+            """
+            INSERT INTO public.class_group_status_history (
+              class_group_id,
+              status,
+              reason_code,
+              reason_note,
+              changed_by_user_id
+            )
+            VALUES (
+              :class_group_id,
+              :status,
+              :reason_code,
+              :reason_note,
+              :changed_by_user_id
+            )
+            """
+        ),
+        {
+            "class_group_id": group_id,
+            "status": status_value,
+            "reason_code": reason_code,
+            "reason_note": reason_note,
+            "changed_by_user_id": changed_by_user_id,
+        },
+    )
 
 
 def _integrity_to_http(e: IntegrityError) -> HTTPException:
@@ -511,6 +569,7 @@ def _get_class_group_or_404(db: Session, group_id: UUID):
                 SELECT
                   cg.id,
                   cg.name,
+                  cg.class_type,
                   cg.level,
                   cg.teacher_id,
                   t.full_name AS teacher_name,
@@ -624,6 +683,7 @@ def _get_class_group_enrollment_or_404(db: Session, group_id: UUID, enrollment_i
 def list_class_groups(
     db: Annotated[Session, Depends(get_db)],
     _user_id: Annotated[str, Depends(get_current_user_id)],
+    class_type: Annotated[str | None, Query()] = None,
     level: Annotated[str | None, Query()] = None,
     is_active: Annotated[bool | None, Query()] = None,
     teacher_id: Annotated[UUID | None, Query()] = None,
@@ -631,6 +691,10 @@ def list_class_groups(
 ):
     where_clauses = []
     params: dict[str, object] = {}
+
+    if class_type is not None:
+        where_clauses.append("cg.class_type = :class_type")
+        params["class_type"] = class_type
 
     if level is not None:
         where_clauses.append("cg.level = :level")
@@ -657,6 +721,7 @@ def list_class_groups(
         SELECT
           cg.id,
           cg.name,
+          cg.class_type,
           cg.level,
           cg.teacher_id,
           t.full_name AS teacher_name,
@@ -692,6 +757,44 @@ def get_class_group(
     return _get_class_group_or_404(db, group_id)
 
 
+@router.get(
+    "/{group_id}/status-history",
+    response_model=list[ClassGroupStatusHistoryItemOut],
+)
+def get_class_group_status_history(
+    group_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    _get_class_group_or_404(db, group_id)
+
+    rows = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  class_group_id,
+                  status,
+                  reason_code,
+                  reason_note,
+                  changed_by_user_id,
+                  created_at
+                FROM public.class_group_status_history
+                WHERE class_group_id = :group_id
+                ORDER BY created_at DESC, id DESC
+                """
+            ),
+            {"group_id": group_id},
+        )
+        .mappings()
+        .all()
+    )
+
+    return rows
+
+
 @router.post("/", response_model=ClassGroupOut, status_code=status.HTTP_201_CREATED)
 def create_class_group(
     payload: ClassGroupCreateIn,
@@ -708,6 +811,7 @@ def create_class_group(
                     """
                     INSERT INTO public.class_groups (
                       name,
+                      class_type,
                       level,
                       teacher_id,
                       court_id,
@@ -717,6 +821,7 @@ def create_class_group(
                     )
                     VALUES (
                       :name,
+                      :class_type,
                       :level,
                       :teacher_id,
                       :court_id,
@@ -727,6 +832,7 @@ def create_class_group(
                     RETURNING
                       id,
                       name,
+                      class_type,
                       level,
                       teacher_id,
                       court_id,
@@ -739,6 +845,7 @@ def create_class_group(
                 ),
                 {
                     "name": payload.name,
+                    "class_type": payload.class_type,
                     "level": payload.level,
                     "teacher_id": payload.teacher_id,
                     "court_id": payload.court_id,
@@ -754,6 +861,14 @@ def create_class_group(
             db,
             group_id=row["id"],
             teacher_id=row["teacher_id"],
+        )
+        _insert_class_group_status_history(
+            db,
+            group_id=row["id"],
+            status_value="active" if row["is_active"] else "inactive",
+            changed_by_user_id=user_id,
+            reason_code="created",
+            reason_note="Cadastro inicial da turma.",
         )
         _sync_group_lesson_events(db, row["id"], user_id)
         db.commit()
@@ -775,15 +890,24 @@ def update_class_group(
 
     current = _get_class_group_or_404(db, group_id)
 
+    if payload.is_active is not None and payload.is_active != current["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Use os endpoints específicos de desativação/reativação da turma para alterar o status.",
+        )
+
     merged = {
         "name": payload.name if payload.name is not None else current["name"],
+        "class_type": payload.class_type
+        if payload.class_type is not None
+        else current["class_type"],
         "level": payload.level if payload.level is not None else current["level"],
         "teacher_id": payload.teacher_id
         if payload.teacher_id is not None
         else current["teacher_id"],
         "court_id": payload.court_id if payload.court_id is not None else current["court_id"],
         "capacity": payload.capacity if payload.capacity is not None else current["capacity"],
-        "is_active": payload.is_active if payload.is_active is not None else current["is_active"],
+        "is_active": current["is_active"],
         "notes": payload.notes if payload.notes is not None else current["notes"],
     }
 
@@ -797,6 +921,7 @@ def update_class_group(
                     UPDATE public.class_groups
                     SET
                       name = :name,
+                      class_type = :class_type,
                       level = :level,
                       teacher_id = :teacher_id,
                       court_id = :court_id,
@@ -808,6 +933,7 @@ def update_class_group(
                     RETURNING
                       id,
                       name,
+                      class_type,
                       level,
                       teacher_id,
                       court_id,
@@ -843,11 +969,17 @@ def update_class_group(
 @router.patch("/{group_id}/deactivate", response_model=ClassGroupOut)
 def deactivate_class_group(
     group_id: UUID,
+    payload: ClassGroupStatusChangeIn | None,
     db: Annotated[Session, Depends(get_db)],
     user_id: Annotated[str, Depends(get_current_user_id)],
 ):
     _require_admin(db, user_id)
-    _get_class_group_or_404(db, group_id)
+    current = _get_class_group_or_404(db, group_id)
+
+    if not current["is_active"]:
+        return current
+
+    reason_code, reason_note = _validate_status_change_payload(payload)
 
     try:
         row = (
@@ -862,6 +994,7 @@ def deactivate_class_group(
                     RETURNING
                       id,
                       name,
+                      class_type,
                       level,
                       teacher_id,
                       court_id,
@@ -876,6 +1009,75 @@ def deactivate_class_group(
             )
             .mappings()
             .first()
+        )
+        _insert_class_group_status_history(
+            db,
+            group_id=group_id,
+            status_value="inactive",
+            changed_by_user_id=user_id,
+            reason_code=reason_code,
+            reason_note=reason_note,
+        )
+        _sync_group_lesson_events(db, group_id, user_id)
+        db.commit()
+        return row
+
+    except IntegrityError as e:
+        db.rollback()
+        raise _integrity_to_http(e) from e
+
+
+@router.patch("/{group_id}/reactivate", response_model=ClassGroupOut)
+def reactivate_class_group(
+    group_id: UUID,
+    payload: ClassGroupStatusChangeIn | None,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    current = _get_class_group_or_404(db, group_id)
+
+    if current["is_active"]:
+        return current
+
+    reason_code, reason_note = _validate_status_change_payload(payload)
+
+    try:
+        row = (
+            db.execute(
+                text(
+                    """
+                    UPDATE public.class_groups
+                    SET
+                      is_active = TRUE,
+                      updated_at = now()
+                    WHERE id = :group_id
+                    RETURNING
+                      id,
+                      name,
+                      class_type,
+                      level,
+                      teacher_id,
+                      court_id,
+                      capacity,
+                      is_active,
+                      notes,
+                      created_at,
+                      updated_at
+                    """
+                ),
+                {"group_id": group_id},
+            )
+            .mappings()
+            .first()
+        )
+        _insert_class_group_status_history(
+            db,
+            group_id=group_id,
+            status_value="active",
+            changed_by_user_id=user_id,
+            reason_code=reason_code,
+            reason_note=reason_note,
         )
         _sync_group_lesson_events(db, group_id, user_id)
         db.commit()

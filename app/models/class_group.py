@@ -20,6 +20,12 @@ class ClassGroup(Base):
     )
 
     name: Mapped[str] = mapped_column(Text, nullable=False)
+    class_type: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'group'"),
+        index=True,
+    )
     level: Mapped[str] = mapped_column(Text, nullable=False)
 
     teacher_id: Mapped[UUID | None] = mapped_column(

@@ -6,12 +6,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+ClassGroupType = Literal["individual", "group"]
 ClassGroupLevel = Literal["iniciante", "intermediario", "avancado"]
 ClassGroupEnrollmentStatus = Literal["active", "inactive", "cancelled"]
 
 
 class ClassGroupCreateIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=150)
+    class_type: ClassGroupType = "group"
     level: ClassGroupLevel
     teacher_id: UUID | None = None
     court_id: UUID | None = None
@@ -22,6 +24,7 @@ class ClassGroupCreateIn(BaseModel):
 
 class ClassGroupUpdateIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=150)
+    class_type: ClassGroupType | None = None
     level: ClassGroupLevel | None = None
     teacher_id: UUID | None = None
     court_id: UUID | None = None
@@ -30,9 +33,15 @@ class ClassGroupUpdateIn(BaseModel):
     notes: str | None = Field(default=None, max_length=1000)
 
 
+class ClassGroupStatusChangeIn(BaseModel):
+    reason_code: str | None = Field(default=None, max_length=60)
+    reason_note: str | None = Field(default=None, max_length=1000)
+
+
 class ClassGroupOut(BaseModel):
     id: UUID
     name: str
+    class_type: str
     level: str
     teacher_id: UUID | None = None
     court_id: UUID | None = None
@@ -46,6 +55,16 @@ class ClassGroupOut(BaseModel):
 class ClassGroupListItemOut(ClassGroupOut):
     teacher_name: str | None = None
     court_name: str | None = None
+
+
+class ClassGroupStatusHistoryItemOut(BaseModel):
+    id: UUID
+    class_group_id: UUID
+    status: str
+    reason_code: str | None = None
+    reason_note: str | None = None
+    changed_by_user_id: UUID | None = None
+    created_at: datetime
 
 
 class ClassGroupScheduleCreateIn(BaseModel):
