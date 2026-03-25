@@ -5,6 +5,7 @@ from app.api.v1.endpoints.auth import router as auth_router
 from app.api.v1.endpoints.bookable_slots import router as bookable_slots_router
 from app.api.v1.endpoints.catalogs import router as catalogs_router
 from app.api.v1.endpoints.class_groups import router as class_groups_router
+from app.api.v1.endpoints.courts import router as courts_router
 from app.api.v1.endpoints.disponibilidade import router as disponibilidade_router
 from app.api.v1.endpoints.events import router as events_router
 from app.api.v1.endpoints.health import router as health_router
@@ -45,6 +46,9 @@ api_router.include_router(catalogs_router, tags=["catalogs"])
 
 # Class Groups -> /api/v1/class-groups/...
 api_router.include_router(class_groups_router, tags=["class-groups"])
+
+# Courts -> /api/v1/courts/...
+api_router.include_router(courts_router, tags=["courts"])
 
 # Teachers -> /api/v1/teachers/...
 api_router.include_router(teachers_router, tags=["teachers"])
