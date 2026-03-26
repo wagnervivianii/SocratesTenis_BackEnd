@@ -5,6 +5,7 @@ from app.api.v1.endpoints.auth import router as auth_router
 from app.api.v1.endpoints.bookable_slots import router as bookable_slots_router
 from app.api.v1.endpoints.catalogs import router as catalogs_router
 from app.api.v1.endpoints.class_groups import router as class_groups_router
+from app.api.v1.endpoints.court_rentals import router as court_rentals_router
 from app.api.v1.endpoints.courts import router as courts_router
 from app.api.v1.endpoints.disponibilidade import router as disponibilidade_router
 from app.api.v1.endpoints.events import router as events_router
@@ -37,6 +38,9 @@ api_router.include_router(events_router, prefix="/events", tags=["events"])
 
 # Trial Lessons -> /api/v1/trial-lessons/...
 api_router.include_router(trial_lessons_router, tags=["trial-lessons"])
+
+# Court Rentals -> /api/v1/court-rentals/...
+api_router.include_router(court_rentals_router, tags=["court-rentals"])
 
 # Bookable Slots -> /api/v1/bookable-slots/...
 api_router.include_router(bookable_slots_router, tags=["bookable-slots"])

@@ -21,6 +21,26 @@ class Court(Base):
 
     name: Mapped[str] = mapped_column(Text, nullable=False)
 
+    surface_type: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    cover_type: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    image_url: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    short_description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

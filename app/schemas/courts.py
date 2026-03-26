@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+CourtSurfaceType = Literal["saibro", "rapida", "cimento", "grama", "outro"]
+CourtCoverType = Literal["descoberta", "coberta", "semi_coberta"]
+
 
 class CourtCreateIn(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
+    surface_type: CourtSurfaceType | None = None
+    cover_type: CourtCoverType | None = None
+    image_url: str | None = Field(default=None, max_length=1000)
+    short_description: str | None = Field(default=None, max_length=300)
     is_active: bool = True
 
 
 class CourtUpdateIn(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=120)
+    surface_type: CourtSurfaceType | None = None
+    cover_type: CourtCoverType | None = None
+    image_url: str | None = Field(default=None, max_length=1000)
+    short_description: str | None = Field(default=None, max_length=300)
     is_active: bool | None = None
 
 
@@ -24,6 +36,10 @@ class CourtStatusChangeIn(BaseModel):
 class CourtOut(BaseModel):
     id: UUID
     name: str
+    surface_type: str | None = None
+    cover_type: str | None = None
+    image_url: str | None = None
+    short_description: str | None = None
     is_active: bool
     created_at: datetime
     updated_at: datetime

@@ -22,6 +22,36 @@ from app.schemas.courts import (
 router = APIRouter(prefix="/courts")
 
 
+_COURT_SELECT_COLUMNS = """
+  id,
+  name,
+  surface_type,
+  cover_type,
+  image_url,
+  short_description,
+  is_active,
+  created_at,
+  updated_at
+"""
+
+
+def _clean_required_text(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="O valor informado não pode ficar vazio.",
+        )
+    return cleaned
+
+
+def _clean_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
 def _get_current_user_row(db: Session, user_id: str):
     return (
         db.execute(
@@ -91,13 +121,9 @@ def _get_court_or_404(db: Session, court_id: UUID):
     row = (
         db.execute(
             text(
-                """
+                f"""
                 SELECT
-                  id,
-                  name,
-                  is_active,
-                  created_at,
-                  updated_at
+                  {_COURT_SELECT_COLUMNS}
                 FROM public.courts
                 WHERE id = :court_id
                 """
@@ -186,7 +212,7 @@ def list_courts(
 
     if q and q.strip():
         params["q"] = f"%{q.strip()}%"
-        where_parts.append("name ILIKE :q")
+        where_parts.append("(name ILIKE :q OR COALESCE(short_description, '') ILIKE :q)")
 
     where_sql = " AND ".join(where_parts)
 
@@ -195,11 +221,7 @@ def list_courts(
             text(
                 f"""
                 SELECT
-                  id,
-                  name,
-                  is_active,
-                  created_at,
-                  updated_at
+                  {_COURT_SELECT_COLUMNS}
                 FROM public.courts
                 WHERE {where_sql}
                 ORDER BY
@@ -273,25 +295,33 @@ def create_court(
         row = (
             db.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO public.courts (
                       name,
+                      surface_type,
+                      cover_type,
+                      image_url,
+                      short_description,
                       is_active
                     )
                     VALUES (
                       :name,
+                      :surface_type,
+                      :cover_type,
+                      :image_url,
+                      :short_description,
                       :is_active
                     )
                     RETURNING
-                      id,
-                      name,
-                      is_active,
-                      created_at,
-                      updated_at
+                      {_COURT_SELECT_COLUMNS}
                     """
                 ),
                 {
-                    "name": payload.name.strip(),
+                    "name": _clean_required_text(payload.name),
+                    "surface_type": payload.surface_type,
+                    "cover_type": payload.cover_type,
+                    "image_url": _clean_optional_text(payload.image_url),
+                    "short_description": _clean_optional_text(payload.short_description),
                     "is_active": payload.is_active,
                 },
             )
@@ -333,26 +363,46 @@ def update_court(
             detail="Use os endpoints específicos de ativação ou inativação para alterar o status da quadra.",
         )
 
+    fields_set = payload.model_fields_set
+
     merged = {
-        "name": payload.name.strip() if payload.name is not None else current["name"],
+        "name": (
+            _clean_required_text(payload.name)
+            if "name" in fields_set and payload.name is not None
+            else current["name"]
+        ),
+        "surface_type": (
+            payload.surface_type if "surface_type" in fields_set else current["surface_type"]
+        ),
+        "cover_type": (payload.cover_type if "cover_type" in fields_set else current["cover_type"]),
+        "image_url": (
+            _clean_optional_text(payload.image_url)
+            if "image_url" in fields_set
+            else current["image_url"]
+        ),
+        "short_description": (
+            _clean_optional_text(payload.short_description)
+            if "short_description" in fields_set
+            else current["short_description"]
+        ),
     }
 
     try:
         row = (
             db.execute(
                 text(
-                    """
+                    f"""
                     UPDATE public.courts
                     SET
                       name = :name,
+                      surface_type = :surface_type,
+                      cover_type = :cover_type,
+                      image_url = :image_url,
+                      short_description = :short_description,
                       updated_at = now()
                     WHERE id = :court_id
                     RETURNING
-                      id,
-                      name,
-                      is_active,
-                      created_at,
-                      updated_at
+                      {_COURT_SELECT_COLUMNS}
                     """
                 ),
                 {
@@ -388,18 +438,14 @@ def deactivate_court(
     row = (
         db.execute(
             text(
-                """
+                f"""
                 UPDATE public.courts
                 SET
                   is_active = FALSE,
                   updated_at = now()
                 WHERE id = :court_id
                 RETURNING
-                  id,
-                  name,
-                  is_active,
-                  created_at,
-                  updated_at
+                  {_COURT_SELECT_COLUMNS}
                 """
             ),
             {"court_id": court_id},
@@ -438,18 +484,14 @@ def reactivate_court(
     row = (
         db.execute(
             text(
-                """
+                f"""
                 UPDATE public.courts
                 SET
                   is_active = TRUE,
                   updated_at = now()
                 WHERE id = :court_id
                 RETURNING
-                  id,
-                  name,
-                  is_active,
-                  created_at,
-                  updated_at
+                  {_COURT_SELECT_COLUMNS}
                 """
             ),
             {"court_id": court_id},
