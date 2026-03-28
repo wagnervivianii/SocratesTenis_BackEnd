@@ -214,6 +214,41 @@ class CourtRentalUpcomingListOut(BaseModel):
     message: str
 
 
+class CourtRentalHistoryItemOut(BaseModel):
+    rental_id: UUID
+    event_id: UUID | None = None
+    status: str
+    payment_status: str | None = None
+    origin: str | None = None
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    court_id: UUID | None = None
+    court_name: str | None = None
+    customer_name: str | None = None
+    customer_email: str | None = None
+    customer_whatsapp: str | None = None
+    total_amount: Decimal | None = None
+    payment_received_amount: Decimal | None = None
+    payment_proof_submitted_at: datetime | None = None
+    payment_reviewed_at: datetime | None = None
+    confirmed_at: datetime | None = None
+    completed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    requested_at: datetime | None = None
+    notes: str | None = None
+    can_cancel: bool = False
+    can_reschedule: bool = False
+    change_deadline_at: datetime | None = None
+    change_rule_message: str | None = None
+    change_status_message: str | None = None
+
+
+class CourtRentalHistoryListOut(BaseModel):
+    items: list[CourtRentalHistoryItemOut]
+    total: int
+    message: str
+
+
 class CourtRentalCancelOut(BaseModel):
     rental_id: UUID
     event_id: UUID
