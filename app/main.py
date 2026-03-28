@@ -3,12 +3,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
 
 # Carrega variáveis do .env no root do projeto (se existir),
 # sem sobrescrever variáveis já definidas no ambiente.
 ROOT = Path(__file__).resolve().parents[1]
+STORAGE_ROOT = ROOT / "storage"
+STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+
 load_dotenv(ROOT / ".env", override=False)
 
 # Importa settings somente após carregar o .env
@@ -26,6 +30,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Publica arquivos de mídia do projeto.
+# Neste checkpoint, tudo que estiver dentro de /storage ficará acessível via /media.
+app.mount("/media", StaticFiles(directory=STORAGE_ROOT), name="media")
 
 
 @app.on_event("startup")
@@ -63,6 +71,7 @@ def root():
         "shorts": "/api/v1/shorts",
         "docs": "/docs",
         "redoc": "/redoc",
+        "media": "/media",
     }
 
 
