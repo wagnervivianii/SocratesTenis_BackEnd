@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -193,6 +195,44 @@ def _validate_status_change_payload(payload: CourtStatusChangeIn | None) -> None
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A observação é obrigatória quando o motivo for 'other'.",
         )
+
+
+def _court_image_storage_root() -> Path:
+    return Path(__file__).resolve().parents[4] / "storage" / "courts"
+
+
+def _guess_court_image_extension(upload: UploadFile) -> str:
+    file_name = upload.filename or "court-image"
+    suffix = Path(file_name).suffix.strip().lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        return suffix
+
+    content_type = (upload.content_type or "").lower()
+    return {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+    }.get(content_type, "")
+
+
+def _remove_managed_court_image_if_exists(*, court_id: UUID, image_url: str | None) -> None:
+    if not image_url:
+        return
+
+    media_marker = "/media/"
+    marker_index = image_url.find(media_marker)
+    if marker_index < 0:
+        return
+
+    relative_media_path = image_url[marker_index + len(media_marker) :].lstrip("/")
+    expected_prefix = f"courts/{court_id}/"
+    if not relative_media_path.startswith(expected_prefix):
+        return
+
+    absolute_path = Path(__file__).resolve().parents[4] / "storage" / relative_media_path
+    if absolute_path.is_file():
+        absolute_path.unlink()
 
 
 @router.get("/", response_model=list[CourtListItemOut])
@@ -419,6 +459,95 @@ def update_court(
     except IntegrityError as e:
         db.rollback()
         raise _integrity_to_http(e) from e
+
+
+@router.post("/{court_id}/image-upload", response_model=CourtOut)
+async def upload_court_image(
+    court_id: UUID,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    image_file: Annotated[UploadFile, File(...)],
+):
+    _require_admin(db, user_id)
+
+    current = _get_court_or_404(db, court_id)
+
+    content_type = (image_file.content_type or "").lower()
+    allowed_content_types = {
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/webp",
+    }
+    if content_type not in allowed_content_types:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Envie a imagem da quadra em PNG, JPG ou WEBP.",
+        )
+
+    file_bytes = await image_file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="O arquivo da imagem está vazio.",
+        )
+
+    max_bytes = 10 * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A imagem da quadra deve ter no máximo 10 MB.",
+        )
+
+    extension = _guess_court_image_extension(image_file)
+    if not extension:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Não foi possível identificar a extensão da imagem enviada.",
+        )
+
+    storage_dir = _court_image_storage_root() / str(court_id)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    stored_file_name = f"{datetime.now():%Y%m%d%H%M%S}_{UUID(user_id).hex}{extension}"
+    absolute_path = storage_dir / stored_file_name
+    absolute_path.write_bytes(file_bytes)
+
+    relative_media_path = Path("courts") / str(court_id) / stored_file_name
+    image_url = str(request.url_for("media", path=relative_media_path.as_posix()))
+
+    try:
+        row = (
+            db.execute(
+                text(
+                    f"""
+                    UPDATE public.courts
+                    SET
+                      image_url = :image_url,
+                      updated_at = now()
+                    WHERE id = :court_id
+                    RETURNING
+                      {_COURT_SELECT_COLUMNS}
+                    """
+                ),
+                {
+                    "court_id": court_id,
+                    "image_url": image_url,
+                },
+            )
+            .mappings()
+            .first()
+        )
+        db.commit()
+    except Exception:
+        if absolute_path.exists():
+            absolute_path.unlink()
+        db.rollback()
+        raise
+
+    _remove_managed_court_image_if_exists(court_id=court_id, image_url=current["image_url"])
+    return row
 
 
 @router.patch("/{court_id}/deactivate", response_model=CourtOut)
