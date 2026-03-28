@@ -35,6 +35,8 @@ from app.schemas.court_rentals import (
     CourtRentalCancelOut,
     CourtRentalCourtCardOut,
     CourtRentalEligibilityOut,
+    CourtRentalHistoryItemOut,
+    CourtRentalHistoryListOut,
     CourtRentalOut,
     CourtRentalPaymentInstructionOut,
     CourtRentalPaymentReviewIn,
@@ -935,6 +937,94 @@ def _get_upcoming_rental_rows(db: Session, owner_user_id: UUID):
     )
 
 
+def _get_rental_history_rows(db: Session, owner_user_id: UUID):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cr.id AS rental_id,
+                  cr.event_id AS event_id,
+                  cr.status AS status,
+                  cr.payment_status AS payment_status,
+                  cr.origin AS origin,
+                  cr.customer_name AS customer_name,
+                  cr.customer_email AS customer_email,
+                  cr.customer_whatsapp AS customer_whatsapp,
+                  cr.total_amount AS total_amount,
+                  cr.payment_received_amount AS payment_received_amount,
+                  cr.payment_proof_submitted_at AS payment_proof_submitted_at,
+                  cr.payment_reviewed_at AS payment_reviewed_at,
+                  cr.confirmed_at AS confirmed_at,
+                  cr.completed_at AS completed_at,
+                  cr.cancelled_at AS cancelled_at,
+                  cr.requested_at AS requested_at,
+                  cr.notes AS notes,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  e.court_id AS court_id,
+                  c.name AS court_name
+                FROM public.court_rentals cr
+                LEFT JOIN public.events e
+                  ON e.id = cr.event_id
+                LEFT JOIN public.courts c
+                  ON c.id = e.court_id
+                WHERE COALESCE(cr.customer_user_id, cr.user_id) = :user_id
+                ORDER BY
+                  COALESCE(e.start_at, cr.requested_at, cr.created_at) DESC,
+                  cr.created_at DESC
+                """
+            ),
+            {"user_id": owner_user_id},
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _get_history_change_policy(row: Any) -> tuple[bool, bool, datetime | None, str | None, str]:
+    status_value = str(row["status"] or "").strip().lower()
+    start_at = row["start_at"]
+
+    if status_value == "completed":
+        return (
+            False,
+            False,
+            None,
+            None,
+            "Esta locação já foi concluída e agora faz parte apenas do histórico.",
+        )
+
+    if status_value == "cancelled":
+        return (
+            False,
+            False,
+            None,
+            None,
+            "Esta locação foi cancelada e agora faz parte apenas do histórico.",
+        )
+
+    if status_value == "rejected":
+        return (
+            False,
+            False,
+            None,
+            None,
+            "Esta locação foi rejeitada e agora faz parte apenas do histórico.",
+        )
+
+    if start_at is None:
+        return (
+            False,
+            False,
+            None,
+            None,
+            "Esta locação não possui janela ativa de alteração no momento.",
+        )
+
+    return _get_change_policy(start_at)
+
+
 def _get_owned_rental_row(db: Session, owner_user_id: UUID, rental_id: UUID):
     return (
         db.execute(
@@ -1150,6 +1240,70 @@ def upcoming_court_rentals(
 
     return CourtRentalUpcomingListOut(
         items=items, message="Locações agendadas localizadas com sucesso."
+    )
+
+
+@router.get("/history", response_model=CourtRentalHistoryListOut)
+def court_rental_history(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    current_user = _get_user_or_404(db, UUID(user_id))
+    rows = _get_rental_history_rows(db, current_user.id)
+
+    if not rows:
+        return CourtRentalHistoryListOut(
+            items=[],
+            total=0,
+            message="Você ainda não possui histórico de locações.",
+        )
+
+    items: list[CourtRentalHistoryItemOut] = []
+
+    for row in rows:
+        (
+            can_cancel,
+            can_reschedule,
+            deadline_at,
+            rule_message,
+            status_message,
+        ) = _get_history_change_policy(row)
+
+        items.append(
+            CourtRentalHistoryItemOut(
+                rental_id=row["rental_id"],
+                event_id=row["event_id"],
+                status=row["status"],
+                payment_status=row["payment_status"],
+                origin=row["origin"],
+                start_at=row["start_at"],
+                end_at=row["end_at"],
+                court_id=row["court_id"],
+                court_name=row["court_name"],
+                customer_name=row["customer_name"],
+                customer_email=row["customer_email"],
+                customer_whatsapp=row["customer_whatsapp"],
+                total_amount=row["total_amount"],
+                payment_received_amount=row["payment_received_amount"],
+                payment_proof_submitted_at=row["payment_proof_submitted_at"],
+                payment_reviewed_at=row["payment_reviewed_at"],
+                confirmed_at=row["confirmed_at"],
+                completed_at=row["completed_at"],
+                cancelled_at=row["cancelled_at"],
+                requested_at=row["requested_at"],
+                notes=row["notes"],
+                can_cancel=can_cancel,
+                can_reschedule=can_reschedule,
+                change_deadline_at=deadline_at,
+                change_rule_message=rule_message,
+                change_status_message=status_message,
+            )
+        )
+
+    return CourtRentalHistoryListOut(
+        items=items,
+        total=len(items),
+        message="Histórico de locações localizado com sucesso.",
     )
 
 
