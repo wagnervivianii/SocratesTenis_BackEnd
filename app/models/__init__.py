@@ -9,6 +9,8 @@ from app.models.class_group_status_history import ClassGroupStatusHistory  # noq
 from app.models.class_group_teacher_assignment import ClassGroupTeacherAssignment  # noqa: F401
 from app.models.court import Court  # noqa: F401
 from app.models.court_rental import CourtRental  # noqa: F401
+from app.models.court_rental_payment_proof import CourtRentalPaymentProof  # noqa: F401
+from app.models.court_rental_payment_setting import CourtRentalPaymentSetting  # noqa: F401
 from app.models.court_status_history import CourtStatusHistory  # noqa: F401
 from app.models.event import Event  # noqa: F401
 from app.models.student import Student  # noqa: F401

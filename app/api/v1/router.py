@@ -5,6 +5,9 @@ from app.api.v1.endpoints.auth import router as auth_router
 from app.api.v1.endpoints.bookable_slots import router as bookable_slots_router
 from app.api.v1.endpoints.catalogs import router as catalogs_router
 from app.api.v1.endpoints.class_groups import router as class_groups_router
+from app.api.v1.endpoints.court_rental_payment_settings import (
+    router as court_rental_payment_settings_router,
+)
 from app.api.v1.endpoints.court_rentals import router as court_rentals_router
 from app.api.v1.endpoints.courts import router as courts_router
 from app.api.v1.endpoints.disponibilidade import router as disponibilidade_router
@@ -41,6 +44,12 @@ api_router.include_router(trial_lessons_router, tags=["trial-lessons"])
 
 # Court Rentals -> /api/v1/court-rentals/...
 api_router.include_router(court_rentals_router, tags=["court-rentals"])
+
+# Court Rental Payment Settings -> /api/v1/court-rental-payment-settings/...
+api_router.include_router(
+    court_rental_payment_settings_router,
+    tags=["court-rental-payment-settings"],
+)
 
 # Bookable Slots -> /api/v1/bookable-slots/...
 api_router.include_router(bookable_slots_router, tags=["bookable-slots"])

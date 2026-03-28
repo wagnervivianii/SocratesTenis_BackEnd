@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -15,8 +17,14 @@ from app.api.v1.deps import get_current_user_id
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.court_rental import CourtRental
+from app.models.court_rental_payment_proof import CourtRentalPaymentProof
 from app.models.student import Student
 from app.models.user import User
+from app.schemas.court_rental_payment_proofs import (
+    CourtRentalPaymentProofListItemOut,
+    CourtRentalPaymentProofOut,
+    CourtRentalPaymentProofUploadOut,
+)
 from app.schemas.court_rentals import (
     CourtRentalAdminCreateIn,
     CourtRentalAdminListItemOut,
@@ -510,6 +518,7 @@ def _build_email_content(
     pix_qr_code_payload: str | None = None,
 ) -> tuple[str, str, str]:
     person_name = recipient_name or "cliente"
+    when_label = _format_when_label(start_at, end_at)
     amount_label = f"R$ {total_amount:.2f}" if total_amount is not None else None
 
     if action == "scheduled":
@@ -559,7 +568,6 @@ def _build_email_content(
         intro = "Houve uma atualização na sua locação de quadra."
         extra = "Confira os dados atualizados abaixo."
 
-    when_label = _format_when_label(start_at, end_at)
     text_body = (
         f"Olá, {person_name}!\n\n"
         f"{intro}\n\n"
@@ -823,18 +831,69 @@ def _build_pending_payment_message(
     )
 
 
+def _get_active_court_rental_payment_setting_row(db: Session):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  id,
+                  name,
+                  pix_key,
+                  merchant_name,
+                  merchant_city,
+                  default_price_per_hour,
+                  proof_whatsapp,
+                  payment_instructions,
+                  is_active,
+                  notes,
+                  created_at,
+                  updated_at
+                FROM public.court_rental_payment_settings
+                WHERE is_active = true
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """
+            )
+        )
+        .mappings()
+        .first()
+    )
+
+
 def _resolve_public_pending_payment_context(
     *,
+    db: Session,
     court_name: str,
     start_at: datetime,
     end_at: datetime,
 ) -> tuple[Decimal | None, Decimal | None, str | None, str | None]:
-    # Nesta etapa, a locação pública já nasce pendente de pagamento/aprovação,
-    # mas o valor/hora definitivo ainda será parametrizado pela administração.
-    # Mantemos os campos preparados para a próxima fase sem inventar cobrança real.
-    when_label = _format_when_label(start_at, end_at)
-    pix_qr_code_payload = f"PENDENTE_ADMIN::{court_name}::{when_label}"
-    return None, None, None, pix_qr_code_payload
+    setting = _get_active_court_rental_payment_setting_row(db)
+
+    if not setting:
+        when_label = _format_when_label(start_at, end_at)
+        pix_qr_code_payload = f"PENDENTE_ADMIN::{court_name}::{when_label}"
+        return None, None, None, pix_qr_code_payload
+
+    price_per_hour = _quantize_money(Decimal(str(setting["default_price_per_hour"])))
+    total_amount = _calculate_total_amount(start_at, end_at, price_per_hour)
+    pix_key = str(setting["pix_key"]).strip()
+
+    try:
+        pix_qr_code_payload = generate_pix_payload(
+            pix_key=pix_key,
+            merchant_name=str(setting["merchant_name"]).strip(),
+            merchant_city=str(setting["merchant_city"]).strip(),
+            amount=total_amount,
+            txid="***",
+        )
+    except PixPayloadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Nao foi possivel gerar o payload Pix com a configuracao ativa: {exc}",
+        ) from exc
+
+    return price_per_hour, total_amount, pix_key, pix_qr_code_payload
 
 
 def _get_upcoming_rental_rows(db: Session, owner_user_id: UUID):
@@ -985,6 +1044,8 @@ def _build_admin_pix_payload(
     court_name: str,
     start_at: datetime,
     end_at: datetime,
+    merchant_name: str = "Socrates Tenis",
+    merchant_city: str = "Sao Paulo",
 ) -> str:
     txid_source = f"CTR{start_at:%Y%m%d%H%M}{end_at:%H%M}"
     txid = "".join(ch for ch in txid_source if ch.isalnum())[:25] or "***"
@@ -992,8 +1053,8 @@ def _build_admin_pix_payload(
     try:
         return generate_pix_payload(
             pix_key=pix_key,
-            merchant_name="Socrates Tenis",
-            merchant_city="Sao Paulo",
+            merchant_name=merchant_name,
+            merchant_city=merchant_city,
             amount=total_amount,
             txid=txid,
         )
@@ -1260,6 +1321,7 @@ def schedule_court_rental(
     court_name = _get_court_name(db, data.court_id)
     price_per_hour, total_amount, pix_key, pix_qr_code_payload = (
         _resolve_public_pending_payment_context(
+            db=db,
             court_name=court_name,
             start_at=data.start_at,
             end_at=data.end_at,
@@ -1335,6 +1397,58 @@ def schedule_court_rental(
     )
 
 
+def _payment_proof_storage_dir() -> Path:
+    return Path(__file__).resolve().parents[4] / "storage" / "court_rental_payment_proofs"
+
+
+def _guess_extension(upload: UploadFile) -> str:
+    file_name = upload.filename or "proof"
+    suffix = Path(file_name).suffix.strip().lower()
+    if suffix in {".pdf", ".png", ".jpg", ".jpeg", ".webp"}:
+        return suffix
+
+    content_type = (upload.content_type or "").lower()
+    return {
+        "application/pdf": ".pdf",
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+    }.get(content_type, "")
+
+
+def _serialize_payment_proof(proof: CourtRentalPaymentProof) -> CourtRentalPaymentProofOut:
+    return CourtRentalPaymentProofOut(
+        id=proof.id,
+        court_rental_id=proof.court_rental_id,
+        uploaded_by_user_id=proof.uploaded_by_user_id,
+        original_file_name=proof.original_file_name,
+        stored_file_name=proof.stored_file_name,
+        storage_path=proof.storage_path,
+        mime_type=proof.mime_type,
+        file_size_bytes=proof.file_size_bytes,
+        notes=proof.notes,
+        created_at=proof.created_at,
+    )
+
+
+def _apply_payment_proof_submission(
+    *,
+    db: Session,
+    rental: CourtRental,
+    received_amount: Decimal | None,
+    proof_notes: str | None,
+) -> CourtRental:
+    rental.payment_status = "proof_sent"
+    rental.status = "awaiting_admin_review"
+    rental.payment_proof_submitted_at = datetime.now(_local_tz())
+    rental.payment_received_amount = received_amount
+    if proof_notes is not None:
+        rental.payment_review_notes = proof_notes
+    db.flush()
+    return rental
+
+
 @router.post("/{rental_id}/payment-proof", response_model=CourtRentalProofSubmissionOut)
 def submit_court_rental_payment_proof(
     rental_id: UUID,
@@ -1371,12 +1485,12 @@ def submit_court_rental_payment_proof(
     )
     proof_notes = _normalize_notes(data.payment_review_notes)
 
-    rental.payment_status = "proof_sent"
-    rental.status = "awaiting_admin_review"
-    rental.payment_proof_submitted_at = datetime.now(_local_tz())
-    rental.payment_received_amount = received_amount
-    if proof_notes is not None:
-        rental.payment_review_notes = proof_notes
+    _apply_payment_proof_submission(
+        db=db,
+        rental=rental,
+        received_amount=received_amount,
+        proof_notes=proof_notes,
+    )
 
     db.commit()
     db.refresh(rental)
@@ -1404,6 +1518,141 @@ def submit_court_rental_payment_proof(
         payment_status=rental.payment_status,
         payment_proof_submitted_at=rental.payment_proof_submitted_at,
         payment_received_amount=rental.payment_received_amount,
+        message=message,
+        email_sent=email_sent,
+    )
+
+
+@router.post("/{rental_id}/payment-proof-upload", response_model=CourtRentalPaymentProofUploadOut)
+async def upload_court_rental_payment_proof(
+    rental_id: UUID,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+    proof_file: Annotated[UploadFile, File(...)],
+    payment_received_amount: Annotated[str | None, Form()] = None,
+    notes: Annotated[str | None, Form()] = None,
+):
+    current_user = _get_user_or_404(db, UUID(user_id))
+    row = _get_owned_rental_row(db, current_user.id, rental_id)
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+
+    rental = db.get(CourtRental, row["rental_id"])
+    if not rental:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Registro da locação não encontrado."
+        )
+
+    if rental.status in {
+        "cancelled",
+        "completed",
+        "rejected",
+        "confirmed",
+    } or rental.payment_status in {"approved", "rejected"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Esta locação não está mais apta a receber comprovante.",
+        )
+
+    content_type = (proof_file.content_type or "").lower()
+    allowed_content_types = {
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/webp",
+    }
+    if content_type not in allowed_content_types:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Envie o comprovante em PDF, PNG, JPG ou WEBP.",
+        )
+
+    file_bytes = await proof_file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="O arquivo do comprovante está vazio.",
+        )
+
+    max_bytes = 10 * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="O comprovante deve ter no máximo 10 MB.",
+        )
+
+    received_amount = None
+    if payment_received_amount is not None and str(payment_received_amount).strip():
+        try:
+            received_amount = _quantize_money(
+                Decimal(str(payment_received_amount).strip().replace(",", "."))
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Informe um valor de pagamento válido.",
+            ) from exc
+
+    proof_notes = _normalize_notes(notes)
+
+    storage_dir = _payment_proof_storage_dir() / str(rental.id)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    extension = _guess_extension(proof_file)
+    stored_file_name = f"{datetime.now(_local_tz()):%Y%m%d%H%M%S}_{UUID(user_id).hex}{extension}"
+    absolute_path = storage_dir / stored_file_name
+    absolute_path.write_bytes(file_bytes)
+
+    proof = CourtRentalPaymentProof(
+        court_rental_id=rental.id,
+        uploaded_by_user_id=current_user.id,
+        original_file_name=proof_file.filename or stored_file_name,
+        stored_file_name=stored_file_name,
+        storage_path=str(absolute_path.relative_to(Path(__file__).resolve().parents[4])),
+        mime_type=content_type,
+        file_size_bytes=len(file_bytes),
+        notes=proof_notes,
+    )
+    db.add(proof)
+
+    _apply_payment_proof_submission(
+        db=db,
+        rental=rental,
+        received_amount=received_amount
+        if received_amount is not None
+        else rental.payment_received_amount,
+        proof_notes=proof_notes,
+    )
+
+    db.commit()
+    db.refresh(rental)
+    db.refresh(proof)
+
+    email_sent = _send_court_rental_email(
+        to_email=rental.customer_email,
+        recipient_name=rental.customer_name,
+        action="proof_received",
+        start_at=row["start_at"],
+        end_at=row["end_at"],
+        court_name=str(row["court_name"]),
+        total_amount=rental.payment_received_amount or rental.total_amount,
+        pix_key=rental.pix_key,
+        pix_qr_code_payload=rental.pix_qr_code_payload,
+    )
+    _mark_confirmation_email_if_sent(db, rental, email_sent)
+
+    message = "Recebemos o seu comprovante e a locação agora está aguardando a validação da administração. Enviamos também um e-mail confirmando o recebimento para o cadastro informado."
+
+    return CourtRentalPaymentProofUploadOut(
+        rental_id=rental.id,
+        status=rental.status,
+        payment_status=rental.payment_status,
+        payment_proof_submitted_at=rental.payment_proof_submitted_at,
+        payment_received_amount=str(rental.payment_received_amount)
+        if rental.payment_received_amount is not None
+        else None,
+        proof=_serialize_payment_proof(proof),
         message=message,
         email_sent=email_sent,
     )
@@ -1668,6 +1917,62 @@ def admin_get_court_rental(
     if not rental:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
     return _serialize_rental(rental)
+
+
+@router.get(
+    "/admin/bookings/{rental_id}/proofs",
+    response_model=list[CourtRentalPaymentProofListItemOut],
+)
+def admin_list_court_rental_payment_proofs(
+    rental_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    rental = db.get(CourtRental, rental_id)
+    if not rental:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+
+    proofs = (
+        db.query(CourtRentalPaymentProof)
+        .filter(CourtRentalPaymentProof.court_rental_id == rental_id)
+        .order_by(CourtRentalPaymentProof.created_at.desc())
+        .all()
+    )
+    return [_serialize_payment_proof(proof) for proof in proofs]
+
+
+@router.get("/admin/bookings/{rental_id}/proofs/{proof_id}/download")
+def admin_download_court_rental_payment_proof(
+    rental_id: UUID,
+    proof_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+    rental = db.get(CourtRental, rental_id)
+    if not rental:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+
+    proof = db.get(CourtRentalPaymentProof, proof_id)
+    if not proof or proof.court_rental_id != rental_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Comprovante não encontrado."
+        )
+
+    absolute_path = Path(__file__).resolve().parents[4] / proof.storage_path
+    if not absolute_path.exists() or not absolute_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Arquivo do comprovante não encontrado no storage.",
+        )
+
+    media_type = proof.mime_type or "application/octet-stream"
+    return FileResponse(
+        path=absolute_path,
+        media_type=media_type,
+        filename=proof.original_file_name,
+    )
 
 
 @router.post(
