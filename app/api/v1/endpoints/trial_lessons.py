@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, datetime, time, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -176,6 +176,51 @@ class TrialLessonRescheduleOut(BaseModel):
     court_id: UUID
     teacher_id: UUID
     message: str
+
+
+class TrialLessonAdminPendingItemOut(BaseModel):
+    trial_lesson_id: str
+    user_id: str
+    event_id: str
+    status: str
+    review_status: str
+    start_at: datetime
+    end_at: datetime
+    court_id: UUID
+    court_name: str
+    teacher_id: UUID
+    teacher_name: str
+    user_name: str | None = None
+    user_email: str | None = None
+    user_whatsapp: str | None = None
+    notes: str | None = None
+    requested_at: datetime | None = None
+    scheduled_at: datetime | None = None
+    expired_at: datetime | None = None
+    review_message: str
+
+
+class TrialLessonAdminPendingListOut(BaseModel):
+    items: list[TrialLessonAdminPendingItemOut]
+    total: int
+    message: str
+
+
+class TrialLessonAttendanceReviewIn(BaseModel):
+    outcome: Literal["completed", "no_show"]
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class TrialLessonAttendanceReviewOut(BaseModel):
+    trial_lesson_id: str
+    event_id: str
+    previous_status: str
+    status: str
+    outcome: str
+    message: str
+    completed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    requires_admin_approval: bool = False
 
 
 def _normalize_notes(notes: str | None) -> str | None:
@@ -637,6 +682,143 @@ def _get_current_scheduled_trial_row(db: Session, user_id: UUID):
     )
 
 
+def _get_trial_review_runtime_status(start_at: datetime, end_at: datetime) -> tuple[str, str]:
+    now = datetime.now(_local_tz())
+    local_end = end_at.astimezone(_local_tz())
+
+    if local_end <= now:
+        return (
+            "attendance_validation_pending",
+            "O período da sua aula grátis expirou e agora ela aguarda validação da escola.",
+        )
+
+    return (
+        "scheduled",
+        "Sua aula grátis está agendada.",
+    )
+
+
+def _get_trial_review_status_message(start_at: datetime, end_at: datetime) -> str:
+    now = datetime.now(_local_tz())
+    local_end = end_at.astimezone(_local_tz())
+
+    if local_end <= now:
+        return (
+            "Período expirado, aguardando validação da escola. "
+            "Enquanto a equipe não confirmar presença ou ausência, não será possível novo agendamento."
+        )
+
+    _can_cancel, can_reschedule, _deadline_at, _rule_message, status_message = _get_change_policy(
+        start_at
+    )
+    if can_reschedule:
+        return status_message
+
+    return "Você ainda pode cancelar até o início da aula, mas o prazo para remarcação já expirou."
+
+
+def _get_trial_attendance_review_row(db: Session, trial_lesson_id: UUID):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  tl.id AS trial_lesson_id,
+                  tl.user_id AS user_id,
+                  tl.event_id AS event_id,
+                  tl.status AS status,
+                  tl.notes AS notes,
+                  tl.requested_at AS requested_at,
+                  tl.scheduled_at AS scheduled_at,
+                  tl.completed_at AS completed_at,
+                  tl.cancelled_at AS cancelled_at,
+                  ag.start_at AS start_at,
+                  ag.end_at AS end_at,
+                  ag.court_id AS court_id,
+                  ag.court_name AS court_name,
+                  ag.teacher_id AS teacher_id,
+                  ag.teacher_name AS teacher_name,
+                  u.full_name AS user_name,
+                  u.email AS user_email,
+                  u.whatsapp AS user_whatsapp
+                FROM public.trial_lessons tl
+                JOIN public.vw_agenda ag
+                  ON ag.event_id = tl.event_id
+                JOIN public.users u
+                  ON u.id = tl.user_id
+                WHERE tl.id = :trial_lesson_id
+                  AND tl.status = 'scheduled'
+                  AND ag.kind = 'primeira_aula'
+                  AND ag.status = 'confirmado'
+                LIMIT 1
+                """
+            ),
+            {"trial_lesson_id": trial_lesson_id},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _list_admin_pending_attendance_rows(db: Session):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  tl.id AS trial_lesson_id,
+                  tl.user_id AS user_id,
+                  tl.event_id AS event_id,
+                  tl.status AS status,
+                  tl.notes AS notes,
+                  tl.requested_at AS requested_at,
+                  tl.scheduled_at AS scheduled_at,
+                  ag.start_at AS start_at,
+                  ag.end_at AS end_at,
+                  ag.court_id AS court_id,
+                  ag.court_name AS court_name,
+                  ag.teacher_id AS teacher_id,
+                  ag.teacher_name AS teacher_name,
+                  u.full_name AS user_name,
+                  u.email AS user_email,
+                  u.whatsapp AS user_whatsapp
+                FROM public.trial_lessons tl
+                JOIN public.vw_agenda ag
+                  ON ag.event_id = tl.event_id
+                JOIN public.users u
+                  ON u.id = tl.user_id
+                WHERE tl.status = 'scheduled'
+                  AND ag.kind = 'primeira_aula'
+                  AND ag.status = 'confirmado'
+                  AND ag.end_at <= now()
+                ORDER BY ag.end_at DESC, tl.scheduled_at DESC NULLS LAST, tl.created_at DESC
+                """
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _require_admin_user(db: Session, user_id: UUID) -> User:
+    user = _get_user_or_404(db, user_id)
+
+    if not getattr(user, "is_active", False):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuário inativo.",
+        )
+
+    role = str(getattr(user, "role", "") or "")
+    if not role.startswith("admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Apenas administradores podem validar aula grátis.",
+        )
+
+    return user
+
+
 def _find_trial_control(db: Session, email: str | None, whatsapp: str | None):
     if not email and not whatsapp:
         return None
@@ -982,8 +1164,18 @@ def _get_trial_block_reason(
             None,
         )
 
+    scheduled_row = _get_current_scheduled_trial_row(db, user.id)
     scheduled = _get_latest_scheduled_trial(db, user.id)
     if scheduled:
+        if scheduled_row and scheduled_row["end_at"].astimezone(_local_tz()) <= datetime.now(
+            _local_tz()
+        ):
+            return (
+                "TRIAL_ATTENDANCE_VALIDATION_PENDING",
+                "O período da sua aula grátis expirou e agora ela aguarda validação da escola.",
+                "attendance_validation_pending",
+            )
+
         if allow_scheduled_for_reschedule:
             control = _get_trial_control_state(db, user)
             if control and bool(control["requires_admin_approval"]):
@@ -1066,13 +1258,40 @@ def current_trial_lesson(
             message="Você não possui aula grátis agendada no momento.",
         )
 
+    runtime_status, runtime_message = _get_trial_review_runtime_status(
+        row["start_at"], row["end_at"]
+    )
+
+    if runtime_status == "attendance_validation_pending":
+        return TrialLessonCurrentOut(
+            scheduled=True,
+            message=runtime_message,
+            trial_lesson_id=str(row["trial_lesson_id"]),
+            event_id=str(row["event_id"]),
+            status=runtime_status,
+            start_at=row["start_at"],
+            end_at=row["end_at"],
+            court_id=row["court_id"],
+            court_name=row["court_name"],
+            teacher_id=row["teacher_id"],
+            teacher_name=row["teacher_name"],
+            notes=row["notes"],
+            can_cancel=False,
+            can_reschedule=False,
+            change_deadline_at=None,
+            change_rule_message=(
+                "Após o término do horário agendado, a aula grátis depende de validação da escola antes de qualquer novo agendamento."
+            ),
+            change_status_message=_get_trial_review_status_message(row["start_at"], row["end_at"]),
+        )
+
     can_cancel, can_reschedule, deadline_at, rule_message, status_message = _get_change_policy(
         row["start_at"]
     )
 
     return TrialLessonCurrentOut(
         scheduled=True,
-        message="Sua aula grátis está agendada.",
+        message=runtime_message,
         trial_lesson_id=str(row["trial_lesson_id"]),
         event_id=str(row["event_id"]),
         status=row["status"],
@@ -1544,6 +1763,145 @@ def reschedule_trial_lesson(
     except IntegrityError as e:
         db.rollback()
         raise _integrity_to_http(e) from e
+
+
+@router.get("/admin/pending-attendance", response_model=TrialLessonAdminPendingListOut)
+def admin_pending_trial_attendance(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    _require_admin_user(db, UUID(user_id))
+
+    rows = _list_admin_pending_attendance_rows(db)
+
+    items = [
+        TrialLessonAdminPendingItemOut(
+            trial_lesson_id=str(row["trial_lesson_id"]),
+            user_id=str(row["user_id"]),
+            event_id=str(row["event_id"]),
+            status=row["status"],
+            review_status="attendance_validation_pending",
+            start_at=row["start_at"],
+            end_at=row["end_at"],
+            court_id=row["court_id"],
+            court_name=row["court_name"],
+            teacher_id=row["teacher_id"],
+            teacher_name=row["teacher_name"],
+            user_name=row["user_name"],
+            user_email=row["user_email"],
+            user_whatsapp=row["user_whatsapp"],
+            notes=row["notes"],
+            requested_at=row["requested_at"],
+            scheduled_at=row["scheduled_at"],
+            expired_at=row["end_at"],
+            review_message="Período expirado, aguardando validação da escola.",
+        )
+        for row in rows
+    ]
+
+    return TrialLessonAdminPendingListOut(
+        items=items,
+        total=len(items),
+        message=(
+            "Há aulas grátis aguardando confirmação de presença no painel admin."
+            if items
+            else "Não há aulas grátis pendentes de validação no momento."
+        ),
+    )
+
+
+@router.post(
+    "/admin/{trial_lesson_id}/attendance-review", response_model=TrialLessonAttendanceReviewOut
+)
+def admin_review_trial_attendance(
+    trial_lesson_id: UUID,
+    data: TrialLessonAttendanceReviewIn,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    _require_admin_user(db, UUID(user_id))
+
+    row = _get_trial_attendance_review_row(db, trial_lesson_id)
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "TRIAL_LESSON_REVIEW_NOT_FOUND",
+                "message": "Aula grátis não encontrada para validação administrativa.",
+            },
+        )
+
+    if row["end_at"].astimezone(_local_tz()) > datetime.now(_local_tz()):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "TRIAL_LESSON_NOT_EXPIRED",
+                "message": "A aula grátis ainda não terminou. Aguarde o fim do horário para validar presença.",
+            },
+        )
+
+    trial = db.get(TrialLesson, trial_lesson_id)
+    if not trial:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "TRIAL_LESSON_REVIEW_NOT_FOUND",
+                "message": "Registro da aula grátis não encontrado.",
+            },
+        )
+
+    current_user = _get_user_or_404(db, UUID(row["user_id"]))
+    review_notes = _normalize_notes(data.notes)
+    previous_status = trial.status
+    requires_admin_approval = False
+    now_local = datetime.now(_local_tz())
+
+    if data.outcome == "completed":
+        trial.status = "completed"
+        trial.completed_at = now_local
+        if review_notes:
+            base_notes = _normalize_notes(trial.notes)
+            trial.notes = (
+                f"{base_notes}\n\nValidação admin: {review_notes}"
+                if base_notes
+                else f"Validação admin: {review_notes}"
+            )
+
+        message = "A aula grátis foi marcada como realizada. Este usuário não poderá agendar outra aula grátis."
+    else:
+        trial.status = "no_show"
+        if review_notes:
+            base_notes = _normalize_notes(trial.notes)
+            trial.notes = (
+                f"{base_notes}\n\nAusência validada pelo admin: {review_notes}"
+                if base_notes
+                else f"Ausência validada pelo admin: {review_notes}"
+            )
+
+        requires_admin_approval = _record_trial_occurrence(
+            db,
+            user=current_user,
+            trial_lesson_id=trial.id,
+            occurrence_type="no_show",
+            description=review_notes or "Ausência validada pelo painel admin.",
+        )
+
+        message = "A aula grátis foi marcada como ausência. O usuário permanece bloqueado até nova validação administrativa."
+
+    db.commit()
+    db.refresh(trial)
+
+    return TrialLessonAttendanceReviewOut(
+        trial_lesson_id=str(trial.id),
+        event_id=str(row["event_id"]),
+        previous_status=previous_status,
+        status=trial.status,
+        outcome=data.outcome,
+        message=message,
+        completed_at=trial.completed_at,
+        cancelled_at=trial.cancelled_at,
+        requires_admin_approval=requires_admin_approval,
+    )
 
 
 @router.post("/request", response_model=TrialLessonRequestOut, status_code=status.HTTP_201_CREATED)
