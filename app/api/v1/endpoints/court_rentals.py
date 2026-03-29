@@ -129,6 +129,219 @@ def _normalize_optional_whatsapp(value: str | None) -> str | None:
     return digits or cleaned
 
 
+def _normalize_email_for_match(value: str | None) -> str | None:
+    cleaned = _normalize_optional_text(value)
+    return cleaned.lower() if cleaned else None
+
+
+def _public_rental_payment_timeout_minutes() -> int:
+    return 15
+
+
+def _build_public_recurring_rental_message() -> str:
+    return (
+        "Esta rota é destinada a locações esporádicas. Para locação recorrente, fale com a escola."
+    )
+
+
+def _build_student_public_route_message() -> str:
+    return (
+        "Identificamos que você já possui cadastro de aluno. As rotas públicas são apenas para locações esporádicas avulsas. "
+        "Para utilizar a condição de aluno, acesse a futura área do aluno assim que disponível ou fale com a escola."
+    )
+
+
+def _append_system_note(existing_notes: str | None, note: str) -> str:
+    previous = _normalize_notes(existing_notes)
+    return note if not previous else f"{previous}\n\n{note}"
+
+
+def _calculate_public_payment_expires_at(reference: datetime | None = None) -> datetime:
+    base = reference or datetime.now(_local_tz())
+    return base + timedelta(minutes=_public_rental_payment_timeout_minutes())
+
+
+def _find_student_match_for_public_routes(db: Session, *, user: User):
+    normalized_email = _normalize_email_for_match(user.email)
+    normalized_phone = _normalize_optional_whatsapp(user.whatsapp)
+
+    if not user.id and not normalized_email and not normalized_phone:
+        return None
+
+    return (
+        db.execute(
+            text(
+                r"""
+                SELECT
+                  id,
+                  full_name,
+                  email,
+                  phone,
+                  user_id
+                FROM public.students
+                WHERE is_active IS TRUE
+                  AND (
+                    user_id = :user_id
+                    OR (:email IS NOT NULL AND lower(coalesce(email, '')) = :email)
+                    OR (
+                      :phone_digits IS NOT NULL
+                      AND regexp_replace(coalesce(phone, ''), '\D', '', 'g') = :phone_digits
+                    )
+                  )
+                ORDER BY created_at ASC
+                LIMIT 1
+                """
+            ),
+            {
+                "user_id": user.id,
+                "email": normalized_email,
+                "phone_digits": normalized_phone,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _ensure_not_student_in_public_rental_route(db: Session, *, user: User) -> None:
+    student_match = _find_student_match_for_public_routes(db, user=user)
+    if student_match is None:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "STUDENT_PUBLIC_RENTAL_NOT_ALLOWED",
+            "message": _build_student_public_route_message(),
+        },
+    )
+
+
+def _expire_overdue_public_pending_rentals(
+    db: Session, *, owner_user_id: UUID | None = None
+) -> int:
+    params: dict[str, Any] = {}
+    owner_where = ""
+    if owner_user_id is not None:
+        owner_where = "AND COALESCE(cr.customer_user_id, cr.user_id) = :owner_user_id"
+        params["owner_user_id"] = owner_user_id
+
+    rows = (
+        db.execute(
+            text(
+                f"""
+                SELECT cr.id AS rental_id, cr.event_id AS event_id
+                FROM public.court_rentals cr
+                WHERE cr.status = 'awaiting_payment'
+                  AND cr.payment_status = 'pending'
+                  AND cr.payment_expires_at IS NOT NULL
+                  AND cr.payment_expires_at <= now()
+                  {owner_where}
+                ORDER BY cr.payment_expires_at ASC
+                """
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+
+    if not rows:
+        return 0
+
+    now_local = datetime.now(_local_tz())
+
+    for row in rows:
+        rental = db.get(CourtRental, row["rental_id"])
+        if rental is None:
+            continue
+
+        _cancel_event(db, row["event_id"])
+        rental.status = "cancelled"
+        rental.payment_status = "expired"
+        rental.cancelled_at = now_local
+        rental.notes = _append_system_note(
+            rental.notes,
+            "Reserva pública expirada automaticamente por falta de pagamento dentro do prazo de 15 minutos.",
+        )
+
+    db.commit()
+    return len(rows)
+
+
+def _get_blocking_active_public_rental_row(db: Session, owner_user_id: UUID):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cr.id AS rental_id,
+                  cr.status AS status,
+                  cr.payment_status AS payment_status,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  e.court_id AS court_id,
+                  c.name AS court_name
+                FROM public.court_rentals cr
+                JOIN public.events e
+                  ON e.id = cr.event_id
+                JOIN public.courts c
+                  ON c.id = e.court_id
+                WHERE COALESCE(cr.customer_user_id, cr.user_id) = :user_id
+                  AND cr.status IN (
+                    'awaiting_payment',
+                    'awaiting_proof',
+                    'awaiting_admin_review',
+                    'scheduled',
+                    'confirmed'
+                  )
+                  AND e.kind = 'locacao'
+                  AND e.status = 'confirmado'
+                  AND e.end_at > now()
+                ORDER BY e.start_at ASC, cr.created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"user_id": owner_user_id},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _build_active_public_rental_block_message(row: Any) -> str:
+    court_name = row["court_name"]
+    start_at = row["start_at"]
+    end_at = row["end_at"]
+    when_label = _format_when_label(start_at, end_at)
+
+    if row["payment_status"] == "pending":
+        return (
+            f"Você já possui uma locação ativa em {court_name} para {when_label}. "
+            "Conclua o pagamento atual antes de abrir outra reserva. "
+            "Se o pagamento não for enviado em até 15 minutos, a reserva expira automaticamente e o horário volta a ficar disponível."
+        )
+
+    return (
+        f"Você já possui uma locação ativa em {court_name} para {when_label}. "
+        "Pelo fluxo público, é permitido manter apenas uma locação ativa por vez."
+    )
+
+
+def _ensure_user_has_no_active_public_rental(db: Session, *, owner_user_id: UUID) -> None:
+    blocking_row = _get_blocking_active_public_rental_row(db, owner_user_id)
+    if blocking_row is None:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "ACTIVE_PUBLIC_RENTAL_ALREADY_EXISTS",
+            "message": _build_active_public_rental_block_message(blocking_row),
+        },
+    )
+
+
 def _local_tz() -> ZoneInfo:
     return ZoneInfo("America/Sao_Paulo")
 
@@ -823,13 +1036,22 @@ def _ensure_slot_available_or_409(
 
 
 def _build_pending_payment_message(
-    total_amount: Decimal | None, pix_key: str | None, pix_qr_code_payload: str | None
+    total_amount: Decimal | None,
+    pix_key: str | None,
+    pix_qr_code_payload: str | None,
+    payment_expires_at: datetime | None = None,
 ) -> str:
+    deadline_message = ""
+    if payment_expires_at is not None:
+        deadline_message = f" O pagamento precisa ser enviado até {_format_when_label(payment_expires_at, payment_expires_at)}."
+
     if total_amount is not None and (pix_key or pix_qr_code_payload):
-        return "Siga as instruções abaixo para pagamento e envio do comprovante."
+        return f"Siga as instruções abaixo para pagamento e envio do comprovante.{deadline_message}"
+
     return (
         "Sua reserva foi registrada e está aguardando definição das instruções de pagamento pela administração. "
         "Você pode acompanhar o status aqui e enviar o comprovante assim que receber a cobrança."
+        f"{deadline_message}"
     )
 
 
@@ -896,6 +1118,59 @@ def _resolve_public_pending_payment_context(
         ) from exc
 
     return price_per_hour, total_amount, pix_key, pix_qr_code_payload
+
+
+def _get_owned_rental_any_status_row(db: Session, owner_user_id: UUID, rental_id: UUID):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cr.id AS rental_id,
+                  cr.event_id AS event_id,
+                  cr.status AS status,
+                  cr.payment_status AS payment_status,
+                  cr.origin AS origin,
+                  cr.customer_name AS customer_name,
+                  cr.customer_email AS customer_email,
+                  cr.customer_whatsapp AS customer_whatsapp,
+                  cr.total_amount AS total_amount,
+                  cr.pix_key AS pix_key,
+                  cr.pix_qr_code_payload AS pix_qr_code_payload,
+                  cr.payment_expires_at AS payment_expires_at,
+                  cr.notes AS notes,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  e.court_id AS court_id,
+                  c.name AS court_name
+                FROM public.court_rentals cr
+                LEFT JOIN public.events e
+                  ON e.id = cr.event_id
+                LEFT JOIN public.courts c
+                  ON c.id = e.court_id
+                WHERE COALESCE(cr.customer_user_id, cr.user_id) = :user_id
+                  AND cr.id = :rental_id
+                LIMIT 1
+                """
+            ),
+            {"user_id": owner_user_id, "rental_id": rental_id},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _raise_if_rental_expired_after_cleanup(row: Any | None) -> None:
+    if not row or row["payment_status"] != "expired":
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "COURT_RENTAL_PAYMENT_EXPIRED",
+            "message": "Sua reserva expirou por falta de pagamento dentro do prazo de 15 minutos. Escolha um novo horário para continuar.",
+        },
+    )
 
 
 def _get_upcoming_rental_rows(db: Session, owner_user_id: UUID):
@@ -1042,6 +1317,7 @@ def _get_owned_rental_row(db: Session, owner_user_id: UUID, rental_id: UUID):
                   cr.total_amount AS total_amount,
                   cr.pix_key AS pix_key,
                   cr.pix_qr_code_payload AS pix_qr_code_payload,
+                  cr.payment_expires_at AS payment_expires_at,
                   cr.notes AS notes,
                   e.start_at AS start_at,
                   e.end_at AS end_at,
@@ -1190,10 +1466,29 @@ def court_rental_eligibility(
     user_id: Annotated[str, Depends(get_current_user_id)],
     db: Annotated[Session, Depends(get_db)],
 ):
-    _get_user_or_404(db, UUID(user_id))
+    current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
+
+    student_match = _find_student_match_for_public_routes(db, user=current_user)
+    if student_match is not None:
+        return CourtRentalEligibilityOut(
+            eligible=False,
+            message=_build_student_public_route_message(),
+        )
+
+    blocking_row = _get_blocking_active_public_rental_row(db, current_user.id)
+    if blocking_row is not None:
+        return CourtRentalEligibilityOut(
+            eligible=False,
+            message=_build_active_public_rental_block_message(blocking_row),
+        )
+
     return CourtRentalEligibilityOut(
         eligible=True,
-        message="Você pode solicitar locações de quadra conforme a disponibilidade da agenda.",
+        message=(
+            "Você pode solicitar uma locação esporádica conforme a disponibilidade da agenda. "
+            f"{_build_public_recurring_rental_message()}"
+        ),
     )
 
 
@@ -1203,6 +1498,7 @@ def upcoming_court_rentals(
     db: Annotated[Session, Depends(get_db)],
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
     rows = _get_upcoming_rental_rows(db, current_user.id)
 
     if not rows:
@@ -1249,6 +1545,7 @@ def court_rental_history(
     db: Annotated[Session, Depends(get_db)],
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
     rows = _get_rental_history_rows(db, current_user.id)
 
     if not rows:
@@ -1316,6 +1613,8 @@ def court_rental_courts_overview(
     day_start_hour: Annotated[int, Query(ge=6, le=22)] = 8,
     day_end_hour: Annotated[int, Query(ge=7, le=23)] = 22,
 ):
+    _expire_overdue_public_pending_rentals(db)
+
     if day_start_hour >= day_end_hour:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1349,6 +1648,8 @@ def court_rental_slots_by_court(
     day_start_hour: Annotated[int, Query(ge=6, le=22)] = 8,
     day_end_hour: Annotated[int, Query(ge=7, le=23)] = 22,
 ):
+    _expire_overdue_public_pending_rentals(db)
+
     if day_start_hour >= day_end_hour:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1393,7 +1694,11 @@ def court_rental_slots(
     day_start_hour: Annotated[int, Query(ge=6, le=22)] = 8,
     day_end_hour: Annotated[int, Query(ge=7, le=23)] = 22,
 ):
-    _get_user_or_404(db, UUID(user_id))
+    current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
+    _ensure_not_student_in_public_rental_route(db, user=current_user)
+    _ensure_user_has_no_active_public_rental(db, owner_user_id=current_user.id)
+
     if day_start_hour >= day_end_hour:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1424,9 +1729,14 @@ def get_court_rental_payment_instructions(
     db: Annotated[Session, Depends(get_db)],
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
+
     row = _get_owned_rental_row(db, current_user.id, rental_id)
     if not row:
+        expired_row = _get_owned_rental_any_status_row(db, current_user.id, rental_id)
+        _raise_if_rental_expired_after_cleanup(expired_row)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+
     return CourtRentalPaymentInstructionOut(
         rental_id=row["rental_id"],
         payment_status=row["payment_status"],
@@ -1438,6 +1748,7 @@ def get_court_rental_payment_instructions(
                 row["total_amount"],
                 row["pix_key"],
                 row["pix_qr_code_payload"],
+                row["payment_expires_at"],
             )
             if row["payment_status"] in {"pending", "proof_sent", "under_review"}
             else "Esta locação não possui cobrança pendente no momento."
@@ -1454,6 +1765,9 @@ def schedule_court_rental(
     db: Annotated[Session, Depends(get_db)],
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
+    _ensure_not_student_in_public_rental_route(db, user=current_user)
+    _ensure_user_has_no_active_public_rental(db, owner_user_id=current_user.id)
 
     if data.end_at <= data.start_at:
         raise HTTPException(
@@ -1505,6 +1819,7 @@ def schedule_court_rental(
             origin="public_landing",
             status="awaiting_payment",
             payment_status="pending",
+            payment_expires_at=_calculate_public_payment_expires_at(),
             price_per_hour=price_per_hour,
             total_amount=total_amount,
             pix_key=pix_key,
@@ -1533,7 +1848,12 @@ def schedule_court_rental(
     )
     _mark_confirmation_email_if_sent(db, rental, email_sent)
 
-    message = _build_pending_payment_message(total_amount, pix_key, pix_qr_code_payload)
+    message = _build_pending_payment_message(
+        total_amount,
+        pix_key,
+        pix_qr_code_payload,
+        rental.payment_expires_at,
+    )
     if email_sent:
         message = f"{message} Enviamos também um e-mail com as orientações atuais para o cadastro informado."
 
@@ -1611,14 +1931,23 @@ def submit_court_rental_payment_proof(
     db: Annotated[Session, Depends(get_db)],
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
     row = _get_owned_rental_row(db, current_user.id, rental_id)
     if not row:
+        expired_row = _get_owned_rental_any_status_row(db, current_user.id, rental_id)
+        _raise_if_rental_expired_after_cleanup(expired_row)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
 
     rental = db.get(CourtRental, row["rental_id"])
     if not rental:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Registro da locação não encontrado."
+        )
+
+    if rental.payment_status == "expired":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Sua reserva expirou por falta de pagamento dentro do prazo de 15 minutos. Escolha um novo horário para continuar.",
         )
 
     if rental.status in {
@@ -1687,14 +2016,23 @@ async def upload_court_rental_payment_proof(
     notes: Annotated[str | None, Form()] = None,
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
     row = _get_owned_rental_row(db, current_user.id, rental_id)
     if not row:
+        expired_row = _get_owned_rental_any_status_row(db, current_user.id, rental_id)
+        _raise_if_rental_expired_after_cleanup(expired_row)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
 
     rental = db.get(CourtRental, row["rental_id"])
     if not rental:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Registro da locação não encontrado."
+        )
+
+    if rental.payment_status == "expired":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Sua reserva expirou por falta de pagamento dentro do prazo de 15 minutos. Escolha um novo horário para continuar.",
         )
 
     if rental.status in {
@@ -1819,8 +2157,11 @@ def cancel_court_rental(
     db: Annotated[Session, Depends(get_db)],
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
     row = _get_owned_rental_row(db, current_user.id, rental_id)
     if not row:
+        expired_row = _get_owned_rental_any_status_row(db, current_user.id, rental_id)
+        _raise_if_rental_expired_after_cleanup(expired_row)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
@@ -1886,8 +2227,11 @@ def reschedule_court_rental(
     db: Annotated[Session, Depends(get_db)],
 ):
     current_user = _get_user_or_404(db, UUID(user_id))
+    _expire_overdue_public_pending_rentals(db, owner_user_id=current_user.id)
     row = _get_owned_rental_row(db, current_user.id, rental_id)
     if not row:
+        expired_row = _get_owned_rental_any_status_row(db, current_user.id, rental_id)
+        _raise_if_rental_expired_after_cleanup(expired_row)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
@@ -1995,6 +2339,7 @@ def admin_list_court_rentals(
     origin: Annotated[str | None, Query()] = None,
 ):
     _require_admin(db, user_id)
+    _expire_overdue_public_pending_rentals(db)
 
     where_parts = ["1 = 1"]
     params: dict[str, Any] = {}
