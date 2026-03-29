@@ -1850,7 +1850,7 @@ def admin_review_trial_attendance(
             },
         )
 
-    current_user = _get_user_or_404(db, UUID(row["user_id"]))
+    current_user = _get_user_or_404(db, row["user_id"])
     review_notes = _normalize_notes(data.notes)
     previous_status = trial.status
     requires_admin_approval = False
