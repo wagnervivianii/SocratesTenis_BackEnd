@@ -20,4 +20,10 @@ from app.models.teacher_availability_exception import TeacherAvailabilityExcepti
 from app.models.teacher_availability_rule import TeacherAvailabilityRule  # noqa: F401
 from app.models.teacher_status_history import TeacherStatusHistory  # noqa: F401
 from app.models.trial_lesson import TrialLesson  # noqa: F401
+from app.models.trial_lesson_extraordinary_request import (  # noqa: F401
+    TrialLessonExtraordinaryRequest,
+)
+from app.models.trial_lesson_teacher_window import (  # noqa: F401
+    TrialLessonTeacherWindow,
+)
 from app.models.user import User  # noqa: F401
