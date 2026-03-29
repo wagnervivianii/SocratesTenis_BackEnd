@@ -150,6 +150,12 @@ class CourtRental(Base):
         nullable=True,
     )
 
+    payment_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+
     confirmation_email_sent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
