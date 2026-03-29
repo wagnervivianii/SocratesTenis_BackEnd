@@ -33,6 +33,7 @@ CourtRentalPaymentStatus = Literal[
     "under_review",
     "approved",
     "rejected",
+    "expired",
 ]
 
 
@@ -284,6 +285,7 @@ class CourtRentalPaymentInstructionOut(BaseModel):
     total_amount: Decimal | None = None
     pix_key: str | None = None
     pix_qr_code_payload: str | None = None
+    payment_expires_at: datetime | None = None
     message: str
 
 
@@ -311,6 +313,7 @@ class CourtRentalOut(BaseModel):
     confirmed_at: datetime | None = None
     completed_at: datetime | None = None
     cancelled_at: datetime | None = None
+    payment_expires_at: datetime | None = None
     confirmation_email_sent_at: datetime | None = None
     payment_proof_submitted_at: datetime | None = None
     payment_reviewed_at: datetime | None = None
