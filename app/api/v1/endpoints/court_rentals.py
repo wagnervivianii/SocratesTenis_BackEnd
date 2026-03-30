@@ -181,11 +181,14 @@ def _find_student_match_for_public_routes(db: Session, *, user: User):
                 FROM public.students
                 WHERE is_active IS TRUE
                   AND (
-                    user_id = :user_id
-                    OR (:email IS NOT NULL AND lower(coalesce(email, '')) = :email)
+                    user_id = CAST(:user_id AS uuid)
                     OR (
-                      :phone_digits IS NOT NULL
-                      AND regexp_replace(coalesce(phone, ''), '\D', '', 'g') = :phone_digits
+                      CAST(:email AS text) IS NOT NULL
+                      AND lower(coalesce(email, '')) = CAST(:email AS text)
+                    )
+                    OR (
+                      CAST(:phone_digits AS text) IS NOT NULL
+                      AND regexp_replace(coalesce(phone, ''), '\D', '', 'g') = CAST(:phone_digits AS text)
                     )
                   )
                 ORDER BY created_at ASC
