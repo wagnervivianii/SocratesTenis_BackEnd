@@ -1,3 +1,4 @@
+import mimetypes
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,6 +31,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Garante MIME correto para arquivos WebP servidos em /media.
+mimetypes.add_type("image/webp", ".webp")
 
 # Publica arquivos de mídia do projeto.
 # Neste checkpoint, tudo que estiver dentro de /storage ficará acessível via /media.
