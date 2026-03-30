@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -233,6 +235,53 @@ def _remove_managed_court_image_if_exists(*, court_id: UUID, image_url: str | No
     absolute_path = Path(__file__).resolve().parents[4] / "storage" / relative_media_path
     if absolute_path.is_file():
         absolute_path.unlink()
+
+
+_ALLOWED_COURT_IMAGE_CONTENT_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+}
+_COURT_IMAGE_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+_COURT_IMAGE_MAX_DIMENSION = 1600
+_COURT_IMAGE_OUTPUT_QUALITY = 80
+
+
+def _optimize_court_image(file_bytes: bytes) -> bytes:
+    try:
+        with Image.open(BytesIO(file_bytes)) as image:
+            normalized = ImageOps.exif_transpose(image)
+            if normalized.mode not in {"RGB", "RGBA"}:
+                normalized = normalized.convert("RGBA" if "A" in normalized.getbands() else "RGB")
+
+            normalized.thumbnail(
+                (_COURT_IMAGE_MAX_DIMENSION, _COURT_IMAGE_MAX_DIMENSION),
+                Image.Resampling.LANCZOS,
+            )
+
+            output = BytesIO()
+            if "A" in normalized.getbands():
+                normalized.save(
+                    output,
+                    format="WEBP",
+                    quality=_COURT_IMAGE_OUTPUT_QUALITY,
+                    method=6,
+                )
+            else:
+                normalized.convert("RGB").save(
+                    output,
+                    format="WEBP",
+                    quality=_COURT_IMAGE_OUTPUT_QUALITY,
+                    method=6,
+                )
+
+            return output.getvalue()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Não foi possível processar a imagem da quadra enviada.",
+        ) from exc
 
 
 @router.get("/", response_model=list[CourtListItemOut])
@@ -474,13 +523,7 @@ async def upload_court_image(
     current = _get_court_or_404(db, court_id)
 
     content_type = (image_file.content_type or "").lower()
-    allowed_content_types = {
-        "image/png",
-        "image/jpeg",
-        "image/jpg",
-        "image/webp",
-    }
-    if content_type not in allowed_content_types:
+    if content_type not in _ALLOWED_COURT_IMAGE_CONTENT_TYPES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Envie a imagem da quadra em PNG, JPG ou WEBP.",
@@ -493,26 +536,20 @@ async def upload_court_image(
             detail="O arquivo da imagem está vazio.",
         )
 
-    max_bytes = 10 * 1024 * 1024
-    if len(file_bytes) > max_bytes:
+    if len(file_bytes) > _COURT_IMAGE_MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="A imagem da quadra deve ter no máximo 10 MB.",
+            detail="A imagem da quadra deve ter no máximo 10 MB antes da otimização.",
         )
 
-    extension = _guess_court_image_extension(image_file)
-    if not extension:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Não foi possível identificar a extensão da imagem enviada.",
-        )
+    optimized_bytes = _optimize_court_image(file_bytes)
 
     storage_dir = _court_image_storage_root() / str(court_id)
     storage_dir.mkdir(parents=True, exist_ok=True)
 
-    stored_file_name = f"{datetime.now():%Y%m%d%H%M%S}_{UUID(user_id).hex}{extension}"
+    stored_file_name = f"{datetime.now():%Y%m%d%H%M%S}_{UUID(user_id).hex}.webp"
     absolute_path = storage_dir / stored_file_name
-    absolute_path.write_bytes(file_bytes)
+    absolute_path.write_bytes(optimized_bytes)
 
     relative_media_path = Path("courts") / str(court_id) / stored_file_name
     image_url = str(request.url_for("media", path=relative_media_path.as_posix()))
