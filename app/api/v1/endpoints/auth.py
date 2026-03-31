@@ -22,7 +22,14 @@ from app.core.security import (
 )
 from app.db.session import get_db
 from app.models.user import User
-from app.schemas.auth import LoginIn, MessageOut, TokenOut
+from app.schemas.auth import (
+    ForgotPasswordRequestIn,
+    LoginIn,
+    MeOut,
+    MessageOut,
+    ResetPasswordIn,
+    TokenOut,
+)
 from app.services.email_sender import (
     ConsoleEmailSender,
     EmailSendError,
@@ -33,6 +40,11 @@ from app.services.email_verification import (
     EmailVerificationExpired,
     EmailVerificationInvalid,
     EmailVerificationService,
+)
+from app.services.password_reset import (
+    PasswordResetExpired,
+    PasswordResetInvalid,
+    PasswordResetService,
 )
 
 router = APIRouter(prefix="/auth")
@@ -100,6 +112,11 @@ def _raise_register_conflict(code: str, message: str) -> None:
     )
 
 
+def _build_password_reset_link(token: str) -> str:
+    reset_path = getattr(settings, "frontend_password_reset_path", "/reset-password")
+    return f"{settings.frontend_url}{reset_path}?token={token}"
+
+
 class RegisterIn(BaseModel):
     full_name: str = Field(min_length=3, max_length=120)
     email: EmailStr
@@ -119,14 +136,6 @@ class RegisterOut(BaseModel):
 
 class ResendVerificationIn(BaseModel):
     email: EmailStr
-
-
-class MeOut(BaseModel):
-    user_id: str
-    email: EmailStr
-    full_name: str | None = None
-    role: str
-    is_active: bool
 
 
 @router.post("/login", response_model=TokenOut)
@@ -175,7 +184,6 @@ def register(data: RegisterIn, request: Request, db: DBSession):
     email_exists = user_by_email is not None
     whatsapp_exists = user_by_whatsapp is not None
 
-    # 1) conflito combinado
     if email_exists and whatsapp_exists:
         same_user = user_by_email.id == user_by_whatsapp.id
 
@@ -190,14 +198,12 @@ def register(data: RegisterIn, request: Request, db: DBSession):
                 "Este e-mail e este WhatsApp já constam no sistema. Faça login para continuar.",
             )
 
-    # 2) conflito só de WhatsApp
     elif whatsapp_exists:
         _raise_register_conflict(
             "WHATSAPP_ALREADY_EXISTS",
             "Já existe um cadastro com este WhatsApp.",
         )
 
-    # 3) conflito só de e-mail
     elif email_exists:
         if user_by_email.is_active and user_by_email.email_verified_at is not None:
             _raise_register_conflict(
@@ -208,7 +214,6 @@ def register(data: RegisterIn, request: Request, db: DBSession):
         user = user_by_email
         created = False
 
-    # 4) novo cadastro
     else:
         user = User(
             email=input_email,
@@ -348,6 +353,76 @@ def resend_verification(data: ResendVerificationIn, request: Request, db: DBSess
     )
 
 
+@router.post("/forgot-password", response_model=MessageOut)
+def forgot_password(data: ForgotPasswordRequestIn, request: Request, db: DBSession):
+    input_email = str(data.email).strip().lower()
+
+    generic_message = "Se existir uma conta compatível com este e-mail, enviaremos um link para redefinição de senha."
+
+    user = db.scalar(select(User).where(User.email == input_email))
+    if not user:
+        return MessageOut(message=generic_message)
+
+    if not user.is_active or user.email_verified_at is None:
+        return MessageOut(message=generic_message)
+
+    if not user.password_hash:
+        return MessageOut(message=generic_message)
+
+    svc = PasswordResetService(ttl_minutes=getattr(settings, "password_reset_ttl_minutes", 30))
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    issued = svc.issue_for_user(db, user.id, ip=ip, user_agent=ua)
+
+    reset_link = _build_password_reset_link(issued.token)
+
+    sender = _get_email_sender()
+    try:
+        sender.send_password_reset_email(user.email, reset_link)
+    except EmailSendError as e:
+        print(f"[EMAIL][ERROR][RESET] to={user.email} user={user.id} err={e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PASSWORD_RESET_EMAIL_FAILED",
+                "message": "Não foi possível enviar o e-mail de redefinição de senha. Tente novamente em instantes.",
+            },
+        ) from None
+
+    print(
+        f"[PASSWORD-RESET] user={user.id} email={user.email} expires_at={issued.expires_at.isoformat()}"
+    )
+
+    return MessageOut(message=generic_message)
+
+
+@router.post("/reset-password", response_model=MessageOut)
+def reset_password(data: ResetPasswordIn, db: DBSession):
+    svc = PasswordResetService(ttl_minutes=getattr(settings, "password_reset_ttl_minutes", 30))
+    new_password_hash = get_password_hash(data.password)
+
+    try:
+        svc.consume_token(db, data.token, password_hash=new_password_hash)
+    except PasswordResetExpired:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PASSWORD_RESET_TOKEN_EXPIRED",
+                "message": "O link de redefinição expirou. Solicite um novo link.",
+            },
+        ) from None
+    except PasswordResetInvalid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PASSWORD_RESET_TOKEN_INVALID",
+                "message": "O link de redefinição é inválido ou já foi utilizado.",
+            },
+        ) from None
+
+    return MessageOut(message="Sua senha foi redefinida com sucesso. Faça login para continuar.")
+
+
 @router.post("/refresh", response_model=TokenOut)
 def refresh(request: Request, response: Response, db: DBSession):
     token = request.cookies.get(settings.refresh_cookie_name)
@@ -389,12 +464,18 @@ def me(user_id: str = Depends(get_current_user_id), db: DBSession = None):
             detail="Usuário não encontrado",
         )
 
+    has_password = bool(user.password_hash)
+
     return MeOut(
         user_id=str(user.id),
         email=user.email,
         full_name=user.full_name,
         role=user.role,
         is_active=user.is_active,
+        email_verified=user.email_verified_at is not None,
+        auth_provider="password" if has_password else None,
+        avatar_url=None,
+        has_password=has_password,
     )
 
 
