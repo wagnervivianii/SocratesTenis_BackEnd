@@ -27,3 +27,4 @@ from app.models.trial_lesson_teacher_window import (  # noqa: F401
     TrialLessonTeacherWindow,
 )
 from app.models.user import User  # noqa: F401
+from app.models.user_identity import UserIdentity  # noqa: F401

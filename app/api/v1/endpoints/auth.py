@@ -1,10 +1,10 @@
-# app/api/v1/endpoints/auth.py
 from __future__ import annotations
 
+from datetime import date
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, text
@@ -22,8 +22,12 @@ from app.core.security import (
 )
 from app.db.session import get_db
 from app.models.user import User
+from app.models.user_identity import UserIdentity
 from app.schemas.auth import (
     ForgotPasswordRequestIn,
+    GoogleAuthCallbackIn,
+    GoogleAuthExchangeOut,
+    GoogleAuthStartOut,
     LoginIn,
     MeOut,
     MessageOut,
@@ -40,6 +44,13 @@ from app.services.email_verification import (
     EmailVerificationExpired,
     EmailVerificationInvalid,
     EmailVerificationService,
+)
+from app.services.google_auth import GoogleAuthError, GoogleAuthService
+from app.services.google_oauth import (
+    GoogleOAuthConfigError,
+    GoogleOAuthExchangeError,
+    GoogleOAuthService,
+    GoogleOAuthStateError,
 )
 from app.services.password_reset import (
     PasswordResetExpired,
@@ -88,6 +99,25 @@ def _normalize_instagram(s: str | None) -> str | None:
     return v or None
 
 
+def _normalize_optional_text(s: str | None) -> str | None:
+    if not s:
+        return None
+    v = " ".join(s.strip().split())
+    return v or None
+
+
+def _age_on_date(birth_date: date, today: date) -> int:
+    return (
+        today.year
+        - birth_date.year
+        - ((today.month, today.day) < (birth_date.month, birth_date.day))
+    )
+
+
+def _is_minor(birth_date: date) -> bool:
+    return _age_on_date(birth_date, date.today()) < 18
+
+
 def _get_email_sender():
     if settings.email_sender_backend.lower() == "smtp":
         cfg = SmtpConfig(
@@ -117,12 +147,26 @@ def _build_password_reset_link(token: str) -> str:
     return f"{settings.frontend_url}{reset_path}?token={token}"
 
 
+def _get_google_identity(db: Session, user_id: UUID) -> UserIdentity | None:
+    return db.scalar(
+        select(UserIdentity).where(
+            UserIdentity.user_id == user_id,
+            UserIdentity.provider == "google",
+        )
+    )
+
+
 class RegisterIn(BaseModel):
     full_name: str = Field(min_length=3, max_length=120)
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
     whatsapp: str = Field(min_length=10, max_length=20)
     instagram: str | None = Field(default=None, max_length=60)
+    birth_date: date
+    zip_code: str = Field(min_length=8, max_length=16)
+    guardian_full_name: str | None = Field(default=None, max_length=120)
+    guardian_whatsapp: str | None = Field(default=None, max_length=20)
+    guardian_relationship: str | None = Field(default=None, max_length=60)
     intent: str = Field(pattern="^(lesson|rental|student)$")
 
 
@@ -142,9 +186,10 @@ class ResendVerificationIn(BaseModel):
 def login(data: LoginIn, response: Response, db: DBSession):
     user = db.scalar(select(User).where(User.email == str(data.email)))
 
-    if not user or not verify_password(data.password, user.password_hash):
+    if not user or not user.password_hash or not verify_password(data.password, user.password_hash):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciais inválidas",
         )
 
     if not user.is_active:
@@ -155,6 +200,80 @@ def login(data: LoginIn, response: Response, db: DBSession):
     _set_refresh_cookie(response, refresh)
 
     return TokenOut(access_token=access, expires_in=settings.access_token_expire_minutes * 60)
+
+
+@router.get("/google/start", response_model=GoogleAuthStartOut)
+def google_auth_start(
+    request: Request,
+    redirect_uri: Annotated[str, Query(min_length=1, max_length=2048)],
+):
+    service = GoogleOAuthService()
+
+    try:
+        result = service.build_authorization_url(
+            redirect_uri=redirect_uri,
+            origin=request.headers.get("origin"),
+        )
+    except GoogleOAuthConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    return GoogleAuthStartOut(
+        authorization_url=result.authorization_url,
+        state=result.state,
+    )
+
+
+@router.post("/google/exchange", response_model=GoogleAuthExchangeOut)
+def google_auth_exchange(data: GoogleAuthCallbackIn, response: Response, db: DBSession):
+    oauth_service = GoogleOAuthService()
+    auth_service = GoogleAuthService()
+
+    try:
+        oauth_service.parse_state(data.state, redirect_uri=data.redirect_uri)
+        profile = oauth_service.exchange_code_for_profile(
+            code=data.code,
+            redirect_uri=data.redirect_uri,
+        )
+        result = auth_service.resolve_or_create_user(db, profile)
+    except GoogleOAuthConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except GoogleOAuthStateError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except GoogleOAuthExchangeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+    except GoogleAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    if not result.user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Usuário inativo",
+        )
+
+    access = create_access_token(subject=str(result.user.id))
+    refresh = create_refresh_token(subject=str(result.user.id))
+    _set_refresh_cookie(response, refresh)
+
+    return GoogleAuthExchangeOut(
+        access_token=access,
+        expires_in=settings.access_token_expire_minutes * 60,
+        avatar_url=result.avatar_url,
+    )
 
 
 @router.post("/register", response_model=RegisterOut, status_code=status.HTTP_201_CREATED)
@@ -169,9 +288,44 @@ def register(data: RegisterIn, request: Request, db: DBSession):
     """
     input_email = str(data.email).strip().lower()
     whatsapp_digits = _only_digits(data.whatsapp)
+    zip_code_digits = _only_digits(data.zip_code)
 
     if len(whatsapp_digits) not in (10, 11):
         raise HTTPException(status_code=400, detail="WhatsApp inválido")
+
+    if len(zip_code_digits) != 8:
+        raise HTTPException(status_code=400, detail="CEP inválido")
+
+    birth_date = data.birth_date
+    if birth_date > date.today():
+        raise HTTPException(status_code=400, detail="Data de nascimento inválida")
+
+    guardian_full_name = _normalize_optional_text(data.guardian_full_name)
+    guardian_relationship = _normalize_optional_text(data.guardian_relationship)
+    guardian_whatsapp_digits = _only_digits(data.guardian_whatsapp or "")
+
+    if _is_minor(birth_date):
+        if not guardian_full_name or len(guardian_full_name) < 3:
+            raise HTTPException(
+                status_code=400,
+                detail="Informe o nome completo do responsável para menores de idade.",
+            )
+
+        if len(guardian_whatsapp_digits) not in (10, 11):
+            raise HTTPException(
+                status_code=400,
+                detail="Informe o telefone do responsável com DDD.",
+            )
+
+        if not guardian_relationship or len(guardian_relationship) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Informe o grau de parentesco do responsável.",
+            )
+    else:
+        guardian_full_name = None
+        guardian_whatsapp_digits = ""
+        guardian_relationship = None
 
     instagram = _normalize_instagram(data.instagram)
     full_name = data.full_name.strip()
@@ -223,6 +377,11 @@ def register(data: RegisterIn, request: Request, db: DBSession):
             is_active=False,
             whatsapp=whatsapp_digits,
             instagram=instagram,
+            birth_date=birth_date,
+            zip_code=zip_code_digits,
+            guardian_full_name=guardian_full_name,
+            guardian_whatsapp=guardian_whatsapp_digits or None,
+            guardian_relationship=guardian_relationship,
         )
         db.add(user)
 
@@ -261,6 +420,17 @@ def register(data: RegisterIn, request: Request, db: DBSession):
 
         db.refresh(user)
         created = True
+
+    if not created:
+        user.password_hash = get_password_hash(data.password)
+        user.full_name = full_name
+        user.whatsapp = whatsapp_digits
+        user.instagram = instagram
+        user.birth_date = birth_date
+        user.zip_code = zip_code_digits
+        user.guardian_full_name = guardian_full_name
+        user.guardian_whatsapp = guardian_whatsapp_digits or None
+        user.guardian_relationship = guardian_relationship
 
     intent_added = False
     try:
@@ -465,6 +635,11 @@ def me(user_id: str = Depends(get_current_user_id), db: DBSession = None):
         )
 
     has_password = bool(user.password_hash)
+    google_identity = _get_google_identity(db, user.id)
+    auth_provider = "password"
+
+    if not has_password and google_identity is not None:
+        auth_provider = "google"
 
     return MeOut(
         user_id=str(user.id),
@@ -473,7 +648,7 @@ def me(user_id: str = Depends(get_current_user_id), db: DBSession = None):
         role=user.role,
         is_active=user.is_active,
         email_verified=user.email_verified_at is not None,
-        auth_provider="password" if has_password else None,
+        auth_provider=auth_provider,
         avatar_url=None,
         has_password=has_password,
     )

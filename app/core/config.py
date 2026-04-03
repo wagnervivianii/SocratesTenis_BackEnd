@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     smtp_from: str = ""
     smtp_use_tls: bool = True
 
+    # Google OAuth
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_authorize_url: str = "https://accounts.google.com/o/oauth2/v2/auth"
+    google_token_url: str = "https://oauth2.googleapis.com/token"
+    google_userinfo_url: str = "https://openidconnect.googleapis.com/v1/userinfo"
+    google_scopes: str = "openid email profile"
+    google_oauth_state_ttl_minutes: int = 10
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

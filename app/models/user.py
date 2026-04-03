@@ -1,10 +1,10 @@
 # app/models/user.py
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, String, Text, func, text
+from sqlalchemy import Boolean, Date, DateTime, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -22,13 +22,20 @@ class User(Base):
     )
 
     email: Mapped[str] = mapped_column(Text, unique=True, index=True, nullable=False)
-    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     full_name: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ✅ novos campos (já existem no banco)
     whatsapp: Mapped[str | None] = mapped_column(String(11), unique=True, index=True, nullable=True)
     instagram: Mapped[str | None] = mapped_column(String(60), nullable=True)
+
+    # ✅ cadastro público complementar
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    zip_code: Mapped[str | None] = mapped_column(String(8), index=True, nullable=True)
+    guardian_full_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    guardian_whatsapp: Mapped[str | None] = mapped_column(String(11), nullable=True)
+    guardian_relationship: Mapped[str | None] = mapped_column(String(60), nullable=True)
 
     role: Mapped[str] = mapped_column(Text, nullable=False, default="admin")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
