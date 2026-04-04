@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -24,12 +25,20 @@ class MeOut(BaseModel):
     user_id: str
     email: EmailStr
     full_name: str | None = None
+    whatsapp: str | None = None
+    instagram: str | None = None
+    birth_date: date | None = None
+    zip_code: str | None = None
+    guardian_full_name: str | None = None
+    guardian_whatsapp: str | None = None
+    guardian_relationship: str | None = None
     role: str
     is_active: bool
     email_verified: bool = False
     auth_provider: Literal["password", "google"] = "password"
     avatar_url: str | None = None
     has_password: bool = True
+    profile_completed: bool = True
 
 
 class ForgotPasswordRequestIn(BaseModel):
@@ -65,3 +74,19 @@ class GoogleAuthExchangeOut(BaseModel):
     expires_in: int
     auth_provider: Literal["google"] = "google"
     avatar_url: str | None = None
+
+
+class CompleteGoogleProfileIn(BaseModel):
+    whatsapp: str = Field(min_length=10, max_length=20)
+    instagram: str | None = Field(default=None, max_length=60)
+    birth_date: date
+    zip_code: str = Field(min_length=8, max_length=9)
+    guardian_full_name: str | None = Field(default=None, max_length=120)
+    guardian_whatsapp: str | None = Field(default=None, max_length=20)
+    guardian_relationship: str | None = Field(default=None, max_length=60)
+    password: str | None = Field(default=None, min_length=8, max_length=255)
+
+
+class CompleteGoogleProfileOut(BaseModel):
+    message: str = "Perfil complementar atualizado com sucesso."
+    profile_completed: bool = True

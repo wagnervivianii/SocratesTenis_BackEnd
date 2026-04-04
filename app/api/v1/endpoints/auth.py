@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -24,6 +24,8 @@ from app.db.session import get_db
 from app.models.user import User
 from app.models.user_identity import UserIdentity
 from app.schemas.auth import (
+    CompleteGoogleProfileIn,
+    CompleteGoogleProfileOut,
     ForgotPasswordRequestIn,
     GoogleAuthCallbackIn,
     GoogleAuthExchangeOut,
@@ -99,23 +101,11 @@ def _normalize_instagram(s: str | None) -> str | None:
     return v or None
 
 
-def _normalize_optional_text(s: str | None) -> str | None:
+def _normalize_guardian_relationship(s: str | None) -> str | None:
     if not s:
         return None
-    v = " ".join(s.strip().split())
+    v = s.strip()
     return v or None
-
-
-def _age_on_date(birth_date: date, today: date) -> int:
-    return (
-        today.year
-        - birth_date.year
-        - ((today.month, today.day) < (birth_date.month, birth_date.day))
-    )
-
-
-def _is_minor(birth_date: date) -> bool:
-    return _age_on_date(birth_date, date.today()) < 18
 
 
 def _get_email_sender():
@@ -156,17 +146,104 @@ def _get_google_identity(db: Session, user_id: UUID) -> UserIdentity | None:
     )
 
 
+def _calculate_age(birth_date: date) -> int:
+    today = datetime.now(UTC).date()
+    age = today.year - birth_date.year
+    if (today.month, today.day) < (birth_date.month, birth_date.day):
+        age -= 1
+    return age
+
+
+def _validate_birth_date(birth_date: date) -> None:
+    today = datetime.now(UTC).date()
+    if birth_date > today:
+        raise HTTPException(status_code=400, detail="Data de nascimento inválida")
+
+
+def _validate_zip_code(zip_code: str) -> str:
+    digits = _only_digits(zip_code)
+    if len(digits) != 8:
+        raise HTTPException(status_code=400, detail="CEP inválido")
+    return digits
+
+
+def _validate_whatsapp(whatsapp: str, *, field_label: str = "WhatsApp") -> str:
+    digits = _only_digits(whatsapp)
+    if len(digits) not in (10, 11):
+        raise HTTPException(status_code=400, detail=f"{field_label} inválido")
+    return digits
+
+
+def _normalize_name(name: str, *, field_label: str = "Nome") -> str:
+    value = name.strip()
+    if len(value) < 3:
+        raise HTTPException(status_code=400, detail=f"{field_label} inválido")
+    return value
+
+
+def _is_minor(birth_date: date) -> bool:
+    return _calculate_age(birth_date) < 18
+
+
+def _apply_guardian_fields(
+    *,
+    user: User,
+    birth_date: date,
+    guardian_full_name: str | None,
+    guardian_whatsapp: str | None,
+    guardian_relationship: str | None,
+) -> None:
+    if _is_minor(birth_date):
+        normalized_guardian_name = _normalize_name(
+            guardian_full_name or "",
+            field_label="Nome do responsável",
+        )
+        normalized_guardian_whatsapp = _validate_whatsapp(
+            guardian_whatsapp or "",
+            field_label="Telefone do responsável",
+        )
+        normalized_guardian_relationship = _normalize_guardian_relationship(guardian_relationship)
+
+        if not normalized_guardian_relationship:
+            raise HTTPException(status_code=400, detail="Parentesco do responsável é obrigatório")
+
+        user.guardian_full_name = normalized_guardian_name
+        user.guardian_whatsapp = normalized_guardian_whatsapp
+        user.guardian_relationship = normalized_guardian_relationship
+        return
+
+    user.guardian_full_name = None
+    user.guardian_whatsapp = None
+    user.guardian_relationship = None
+
+
+def _is_profile_completed(user: User) -> bool:
+    if not user.whatsapp:
+        return False
+    if not user.birth_date:
+        return False
+    if not user.zip_code:
+        return False
+
+    if _is_minor(user.birth_date):
+        return bool(
+            user.guardian_full_name and user.guardian_whatsapp and user.guardian_relationship
+        )
+
+    return True
+
+
 class RegisterIn(BaseModel):
     full_name: str = Field(min_length=3, max_length=120)
     email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
     whatsapp: str = Field(min_length=10, max_length=20)
     instagram: str | None = Field(default=None, max_length=60)
     birth_date: date
-    zip_code: str = Field(min_length=8, max_length=16)
+    zip_code: str = Field(min_length=8, max_length=10)
     guardian_full_name: str | None = Field(default=None, max_length=120)
     guardian_whatsapp: str | None = Field(default=None, max_length=20)
-    guardian_relationship: str | None = Field(default=None, max_length=60)
+    guardian_relationship: str | None = Field(default=None, max_length=80)
     intent: str = Field(pattern="^(lesson|rental|student)$")
 
 
@@ -186,10 +263,41 @@ class ResendVerificationIn(BaseModel):
 def login(data: LoginIn, response: Response, db: DBSession):
     user = db.scalar(select(User).where(User.email == str(data.email)))
 
-    if not user or not user.password_hash or not verify_password(data.password, user.password_hash):
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciais inválidas",
+            detail="E-mail ou senha inválidos",
+        )
+
+    if not user.password_hash:
+        google_identity = _get_google_identity(db, user.id)
+        if google_identity is not None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "GOOGLE_ACCOUNT_WITHOUT_PASSWORD",
+                    "message": (
+                        "Esta conta foi criada com Google e ainda não possui senha. "
+                        "Entre com Google para concluir o cadastro e definir sua senha."
+                    ),
+                },
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "ACCOUNT_WITHOUT_PASSWORD",
+                "message": (
+                    "Esta conta ainda não possui uma senha cadastrada. "
+                    "Use o método original de acesso ou redefina sua senha."
+                ),
+            },
+        )
+
+    if not verify_password(data.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="E-mail ou senha inválidos",
         )
 
     if not user.is_active:
@@ -276,6 +384,73 @@ def google_auth_exchange(data: GoogleAuthCallbackIn, response: Response, db: DBS
     )
 
 
+@router.post("/google/complete-profile", response_model=CompleteGoogleProfileOut)
+def complete_google_profile(
+    data: CompleteGoogleProfileIn,
+    user_id: str = Depends(get_current_user_id),
+    db: DBSession = None,
+):
+    user = db.get(User, UUID(user_id))
+
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    google_identity = _get_google_identity(db, user.id)
+    if google_identity is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Este fluxo de complemento é exclusivo para contas com login Google",
+        )
+
+    birth_date = data.birth_date
+    _validate_birth_date(birth_date)
+
+    if not user.password_hash:
+        raw_password = (data.password or "").strip()
+        if len(raw_password) < 8:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Para concluir o primeiro acesso com Google, defina uma senha de pelo menos 8 caracteres"
+                ),
+            )
+        user.password_hash = get_password_hash(raw_password)
+
+    normalized_whatsapp = _validate_whatsapp(data.whatsapp)
+    normalized_zip_code = _validate_zip_code(data.zip_code)
+    normalized_instagram = _normalize_instagram(data.instagram)
+
+    user.whatsapp = normalized_whatsapp
+    user.instagram = normalized_instagram
+    user.birth_date = birth_date
+    user.zip_code = normalized_zip_code
+
+    _apply_guardian_fields(
+        user=user,
+        birth_date=birth_date,
+        guardian_full_name=data.guardian_full_name,
+        guardian_whatsapp=data.guardian_whatsapp,
+        guardian_relationship=data.guardian_relationship,
+    )
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Não foi possível salvar os dados complementares do perfil",
+        ) from None
+
+    db.refresh(user)
+
+    return CompleteGoogleProfileOut(
+        user_id=str(user.id),
+        profile_completed=_is_profile_completed(user),
+        message="Perfil complementar atualizado com sucesso",
+    )
+
+
 @router.post("/register", response_model=RegisterOut, status_code=status.HTTP_201_CREATED)
 def register(data: RegisterIn, request: Request, db: DBSession):
     """
@@ -287,48 +462,12 @@ def register(data: RegisterIn, request: Request, db: DBSession):
     - Se não existe: cria users (is_active=false) + envia verificação
     """
     input_email = str(data.email).strip().lower()
-    whatsapp_digits = _only_digits(data.whatsapp)
-    zip_code_digits = _only_digits(data.zip_code)
-
-    if len(whatsapp_digits) not in (10, 11):
-        raise HTTPException(status_code=400, detail="WhatsApp inválido")
-
-    if len(zip_code_digits) != 8:
-        raise HTTPException(status_code=400, detail="CEP inválido")
-
-    birth_date = data.birth_date
-    if birth_date > date.today():
-        raise HTTPException(status_code=400, detail="Data de nascimento inválida")
-
-    guardian_full_name = _normalize_optional_text(data.guardian_full_name)
-    guardian_relationship = _normalize_optional_text(data.guardian_relationship)
-    guardian_whatsapp_digits = _only_digits(data.guardian_whatsapp or "")
-
-    if _is_minor(birth_date):
-        if not guardian_full_name or len(guardian_full_name) < 3:
-            raise HTTPException(
-                status_code=400,
-                detail="Informe o nome completo do responsável para menores de idade.",
-            )
-
-        if len(guardian_whatsapp_digits) not in (10, 11):
-            raise HTTPException(
-                status_code=400,
-                detail="Informe o telefone do responsável com DDD.",
-            )
-
-        if not guardian_relationship or len(guardian_relationship) < 2:
-            raise HTTPException(
-                status_code=400,
-                detail="Informe o grau de parentesco do responsável.",
-            )
-    else:
-        guardian_full_name = None
-        guardian_whatsapp_digits = ""
-        guardian_relationship = None
+    whatsapp_digits = _validate_whatsapp(data.whatsapp)
+    zip_code_digits = _validate_zip_code(data.zip_code)
+    _validate_birth_date(data.birth_date)
 
     instagram = _normalize_instagram(data.instagram)
-    full_name = data.full_name.strip()
+    full_name = _normalize_name(data.full_name)
 
     user_by_email = db.scalar(select(User).where(User.email == input_email))
     user_by_whatsapp = None
@@ -377,11 +516,15 @@ def register(data: RegisterIn, request: Request, db: DBSession):
             is_active=False,
             whatsapp=whatsapp_digits,
             instagram=instagram,
-            birth_date=birth_date,
+            birth_date=data.birth_date,
             zip_code=zip_code_digits,
-            guardian_full_name=guardian_full_name,
-            guardian_whatsapp=guardian_whatsapp_digits or None,
-            guardian_relationship=guardian_relationship,
+        )
+        _apply_guardian_fields(
+            user=user,
+            birth_date=data.birth_date,
+            guardian_full_name=data.guardian_full_name,
+            guardian_whatsapp=data.guardian_whatsapp,
+            guardian_relationship=data.guardian_relationship,
         )
         db.add(user)
 
@@ -422,15 +565,20 @@ def register(data: RegisterIn, request: Request, db: DBSession):
         created = True
 
     if not created:
-        user.password_hash = get_password_hash(data.password)
         user.full_name = full_name
         user.whatsapp = whatsapp_digits
         user.instagram = instagram
-        user.birth_date = birth_date
+        user.birth_date = data.birth_date
         user.zip_code = zip_code_digits
-        user.guardian_full_name = guardian_full_name
-        user.guardian_whatsapp = guardian_whatsapp_digits or None
-        user.guardian_relationship = guardian_relationship
+        _apply_guardian_fields(
+            user=user,
+            birth_date=data.birth_date,
+            guardian_full_name=data.guardian_full_name,
+            guardian_whatsapp=data.guardian_whatsapp,
+            guardian_relationship=data.guardian_relationship,
+        )
+        db.commit()
+        db.refresh(user)
 
     intent_added = False
     try:
@@ -537,7 +685,21 @@ def forgot_password(data: ForgotPasswordRequestIn, request: Request, db: DBSessi
         return MessageOut(message=generic_message)
 
     if not user.password_hash:
-        return MessageOut(message=generic_message)
+        google_identity = _get_google_identity(db, user.id)
+        if google_identity is not None:
+            return MessageOut(
+                message=(
+                    "Esta conta foi criada com Google e ainda não possui senha. "
+                    "Entre com Google para concluir o cadastro e definir sua senha."
+                )
+            )
+
+        return MessageOut(
+            message=(
+                "Esta conta ainda não possui uma senha cadastrada. "
+                "Use o método original de acesso ou conclua o cadastro antes de redefinir a senha."
+            )
+        )
 
     svc = PasswordResetService(ttl_minutes=getattr(settings, "password_reset_ttl_minutes", 30))
     ip = request.client.host if request.client else None
@@ -649,8 +811,20 @@ def me(user_id: str = Depends(get_current_user_id), db: DBSession = None):
         is_active=user.is_active,
         email_verified=user.email_verified_at is not None,
         auth_provider=auth_provider,
-        avatar_url=None,
+        avatar_url=(
+            getattr(google_identity, "provider_avatar_url", None)
+            if google_identity is not None
+            else None
+        ),
         has_password=has_password,
+        whatsapp=user.whatsapp,
+        instagram=user.instagram,
+        birth_date=user.birth_date,
+        zip_code=user.zip_code,
+        guardian_full_name=user.guardian_full_name,
+        guardian_whatsapp=user.guardian_whatsapp,
+        guardian_relationship=user.guardian_relationship,
+        profile_completed=_is_profile_completed(user),
     )
 
 
