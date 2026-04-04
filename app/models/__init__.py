@@ -14,6 +14,7 @@ from app.models.court_rental_payment_setting import CourtRentalPaymentSetting  #
 from app.models.court_status_history import CourtStatusHistory  # noqa: F401
 from app.models.event import Event  # noqa: F401
 from app.models.student import Student  # noqa: F401
+from app.models.student_signup_request import StudentSignupRequest  # noqa: F401
 from app.models.student_status_history import StudentStatusHistory  # noqa: F401
 from app.models.teacher import Teacher  # noqa: F401
 from app.models.teacher_availability_exception import TeacherAvailabilityException  # noqa: F401

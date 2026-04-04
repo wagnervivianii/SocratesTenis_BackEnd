@@ -13,6 +13,9 @@ from app.api.v1.endpoints.courts import router as courts_router
 from app.api.v1.endpoints.disponibilidade import router as disponibilidade_router
 from app.api.v1.endpoints.events import router as events_router
 from app.api.v1.endpoints.health import router as health_router
+from app.api.v1.endpoints.student_signup_requests import (
+    router as student_signup_requests_router,
+)
 from app.api.v1.endpoints.students import router as students_router
 from app.api.v1.endpoints.teachers import router as teachers_router
 from app.api.v1.endpoints.trial_lessons import router as trial_lessons_router
@@ -68,6 +71,9 @@ api_router.include_router(teachers_router, tags=["teachers"])
 
 # Students -> /api/v1/students/...
 api_router.include_router(students_router, tags=["students"])
+
+# Student Signup Requests -> /api/v1/student-signup-requests/...
+api_router.include_router(student_signup_requests_router, tags=["student-signup-requests"])
 
 # Shorts (YouTube) -> /api/v1/shorts/...
 api_router.include_router(shorts_router, tags=["shorts"])
