@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Annotated
+from urllib.parse import urlencode
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -9,6 +10,7 @@ from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user_id
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.student import Student
 from app.models.student_signup_request import StudentSignupRequest
@@ -21,6 +23,13 @@ from app.schemas.student_signup_requests import (
     StudentSignupRequestReviewIn,
     StudentSignupRequestReviewOut,
 )
+from app.services.email_sender import (
+    ConsoleEmailSender,
+    EmailSendError,
+    SmtpConfig,
+    SmtpEmailSender,
+)
+from app.services.password_reset import PasswordResetService
 
 router = APIRouter(prefix="/student-signup-requests")
 
@@ -134,7 +143,46 @@ def _require_admin(db: Session, user_id: str) -> None:
         )
 
 
-def _to_list_item_out(request: StudentSignupRequest) -> StudentSignupRequestListItemOut:
+def _resolve_email_confirmed_at(
+    *,
+    request: StudentSignupRequest,
+    approved_user: User | None,
+):
+    if request.status != "approved":
+        return None
+    if approved_user is None:
+        return None
+    return approved_user.email_verified_at
+
+
+def _resolve_email_confidence_status(
+    *,
+    request: StudentSignupRequest,
+    approved_user: User | None,
+) -> str:
+    if request.status == "pending":
+        return "awaiting_review"
+    if request.status == "rejected":
+        return "rejected"
+    if approved_user and approved_user.email_verified_at is not None:
+        return "confirmed"
+    return "pending_confirmation"
+
+
+def _to_list_item_out(
+    request: StudentSignupRequest,
+    *,
+    approved_user: User | None = None,
+) -> StudentSignupRequestListItemOut:
+    email_confirmed_at = _resolve_email_confirmed_at(
+        request=request,
+        approved_user=approved_user,
+    )
+    email_confidence_status = _resolve_email_confidence_status(
+        request=request,
+        approved_user=approved_user,
+    )
+
     return StudentSignupRequestListItemOut(
         id=request.id,
         full_name=request.full_name,
@@ -152,6 +200,8 @@ def _to_list_item_out(request: StudentSignupRequest) -> StudentSignupRequestList
         reviewed_by_user_id=request.reviewed_by_user_id,
         approved_user_id=request.approved_user_id,
         approved_student_id=request.approved_student_id,
+        email_confidence_status=email_confidence_status,
+        email_confirmed_at=email_confirmed_at,
         created_at=request.created_at,
         updated_at=request.updated_at,
     )
@@ -165,6 +215,207 @@ def _get_request_or_404(db: Session, request_id: UUID) -> StudentSignupRequest:
             detail="Solicitação de aluno não encontrada.",
         )
     return request
+
+
+def _get_approved_user_for_request(
+    db: Session,
+    request: StudentSignupRequest,
+) -> User | None:
+    if request.approved_user_id is None:
+        return None
+    return db.get(User, request.approved_user_id)
+
+
+def _get_email_sender():
+    if settings.email_sender_backend.lower() == "smtp":
+        cfg = SmtpConfig(
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_username,
+            password=settings.smtp_password,
+            mail_from=settings.smtp_from,
+            use_tls=settings.smtp_use_tls,
+        )
+        return SmtpEmailSender(cfg)
+    return ConsoleEmailSender()
+
+
+def _build_first_access_link(*, token: str, email: str) -> str:
+    query = urlencode({"token": token, "email": email})
+    return f"{settings.frontend_url}/primeiro-acesso?{query}"
+
+
+def _build_login_link(*, email: str) -> str:
+    query = urlencode({"email": email})
+    return f"{settings.frontend_url}/login?{query}"
+
+
+def _protected_non_student_role(role: str | None) -> bool:
+    value = (role or "").strip().lower()
+    if not value:
+        return False
+    if value.startswith("admin"):
+        return True
+    if value in {"coach", "teacher", "professor", "prof", "employee", "collaborator"}:
+        return True
+    return False
+
+
+def _create_or_update_user_for_approved_request(
+    *,
+    db: Session,
+    request: StudentSignupRequest,
+) -> User:
+    existing_user = db.scalar(select(User).where(User.email == request.email))
+
+    whatsapp_owner = db.scalar(select(User).where(User.whatsapp == request.whatsapp))
+    if whatsapp_owner is not None and (
+        existing_user is None or whatsapp_owner.id != existing_user.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Já existe um usuário com o WhatsApp informado nesta solicitação.",
+        )
+
+    if existing_user is None:
+        user = User(
+            email=request.email,
+            password_hash=None,
+            full_name=request.full_name,
+            whatsapp=request.whatsapp,
+            instagram=request.instagram,
+            birth_date=request.birth_date,
+            zip_code=request.zip_code,
+            guardian_full_name=request.guardian_full_name,
+            guardian_whatsapp=request.guardian_whatsapp,
+            guardian_relationship=request.guardian_relationship,
+            role="student",
+            is_active=True,
+            email_verified_at=None,
+        )
+        db.add(user)
+        db.flush()
+        return user
+
+    if _protected_non_student_role(existing_user.role):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Já existe uma conta institucional com este e-mail. Revise manualmente antes de aprovar como aluno."
+            ),
+        )
+
+    existing_user.full_name = existing_user.full_name or request.full_name
+    existing_user.whatsapp = request.whatsapp or existing_user.whatsapp
+    existing_user.instagram = existing_user.instagram or request.instagram
+    existing_user.birth_date = existing_user.birth_date or request.birth_date
+    existing_user.zip_code = existing_user.zip_code or request.zip_code
+    existing_user.guardian_full_name = (
+        existing_user.guardian_full_name or request.guardian_full_name
+    )
+    existing_user.guardian_whatsapp = existing_user.guardian_whatsapp or request.guardian_whatsapp
+    existing_user.guardian_relationship = (
+        existing_user.guardian_relationship or request.guardian_relationship
+    )
+    existing_user.is_active = True
+    existing_user.role = "student"
+    existing_user.updated_at = datetime.now(UTC)
+
+    return existing_user
+
+
+def _create_or_update_student_for_approved_request(
+    *,
+    db: Session,
+    request: StudentSignupRequest,
+    user: User,
+) -> Student:
+    existing_student = db.scalar(select(Student).where(Student.email == request.email))
+
+    if existing_student is None:
+        student = Student(
+            user_id=user.id,
+            full_name=request.full_name,
+            email=request.email,
+            phone=request.whatsapp,
+            notes="Cadastro aprovado a partir de solicitação pública de aluno.",
+            profession=None,
+            instagram_handle=request.instagram,
+            share_profession=False,
+            share_instagram=False,
+            is_active=True,
+        )
+        db.add(student)
+        db.flush()
+        return student
+
+    if existing_student.user_id is None:
+        existing_student.user_id = user.id
+
+    existing_student.full_name = existing_student.full_name or request.full_name
+    existing_student.phone = existing_student.phone or request.whatsapp
+    existing_student.instagram_handle = existing_student.instagram_handle or request.instagram
+    existing_student.is_active = True
+
+    return existing_student
+
+
+def _issue_first_access_token(db: Session, user: User) -> str | None:
+    if user.password_hash:
+        return None
+
+    svc = PasswordResetService(ttl_minutes=getattr(settings, "password_reset_ttl_minutes", 30))
+    issued = svc.issue_for_user(db, user.id, ip=None, user_agent="student-signup-approval")
+    return issued.token
+
+
+def _send_received_email(request: StudentSignupRequest) -> None:
+    sender = _get_email_sender()
+    try:
+        sender.send_student_signup_received_email(
+            to_email=request.email,
+            student_name=request.full_name,
+        )
+    except EmailSendError as exc:
+        print(
+            f"[EMAIL][STUDENT_SIGNUP][RECEIVED][ERROR] to={request.email} request={request.id} err={exc}"
+        )
+
+
+def _send_approved_email(*, db: Session, request: StudentSignupRequest, user: User) -> None:
+    sender = _get_email_sender()
+    token = _issue_first_access_token(db=db, user=user)
+    login_link = (
+        _build_first_access_link(token=token, email=user.email)
+        if token
+        else _build_login_link(email=user.email)
+    )
+
+    try:
+        sender.send_student_signup_approved_email(
+            to_email=user.email,
+            student_name=request.full_name,
+            login_link=login_link,
+        )
+    except EmailSendError as exc:
+        print(
+            f"[EMAIL][STUDENT_SIGNUP][APPROVED][ERROR] to={user.email} request={request.id} err={exc}"
+        )
+
+
+def _send_rejected_email(request: StudentSignupRequest) -> None:
+    sender = _get_email_sender()
+    contact_email = settings.smtp_from or None
+    try:
+        sender.send_student_signup_rejected_email(
+            to_email=request.email,
+            student_name=request.full_name,
+            contact_email=contact_email,
+        )
+    except EmailSendError as exc:
+        print(
+            f"[EMAIL][STUDENT_SIGNUP][REJECTED][ERROR] to={request.email} request={request.id} err={exc}"
+        )
 
 
 @router.post("", response_model=StudentSignupRequestCreateOut, status_code=status.HTTP_201_CREATED)
@@ -212,7 +463,7 @@ def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSess
     if existing_student is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Já existe um aluno cadastrado com este e-mail.",
+            detail="Já existe um aluno cadastrado com este e-mail. Aguarde a ativação ou faça login se já tiver acesso.",
         )
 
     existing_pending_request = db.scalar(
@@ -230,6 +481,21 @@ def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSess
             detail="Já existe uma solicitação pendente para este aluno. Aguarde a conferência da equipe.",
         )
 
+    existing_rejected_request = db.scalar(
+        select(StudentSignupRequest).where(
+            StudentSignupRequest.status == "rejected",
+            or_(
+                StudentSignupRequest.email == normalized_email,
+                StudentSignupRequest.whatsapp == normalized_whatsapp,
+            ),
+        )
+    )
+    if existing_rejected_request is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Já existe uma solicitação anterior não aprovada para este cadastro. Entre em contato com a escola para mais informações.",
+        )
+
     request = StudentSignupRequest(
         full_name=normalized_full_name,
         email=normalized_email,
@@ -245,6 +511,8 @@ def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSess
     db.add(request)
     db.commit()
     db.refresh(request)
+
+    _send_received_email(request)
 
     return StudentSignupRequestCreateOut(request_id=request.id, status="pending")
 
@@ -269,7 +537,22 @@ def list_student_signup_requests(
         stmt = stmt.where(StudentSignupRequest.status == normalized_status)
 
     requests = db.scalars(stmt).all()
-    return [_to_list_item_out(item) for item in requests]
+
+    approved_user_ids = {
+        request.approved_user_id for request in requests if request.approved_user_id is not None
+    }
+    approved_user_map: dict[UUID, User] = {}
+    if approved_user_ids:
+        approved_users = db.scalars(select(User).where(User.id.in_(approved_user_ids))).all()
+        approved_user_map = {user.id: user for user in approved_users}
+
+    return [
+        _to_list_item_out(
+            item,
+            approved_user=approved_user_map.get(item.approved_user_id),
+        )
+        for item in requests
+    ]
 
 
 @router.get("/{request_id}", response_model=StudentSignupRequestOut)
@@ -280,7 +563,10 @@ def get_student_signup_request(
 ):
     _require_admin(db, user_id)
     request = _get_request_or_404(db, request_id)
-    return StudentSignupRequestOut(**_to_list_item_out(request).model_dump())
+    approved_user = _get_approved_user_for_request(db, request)
+    return StudentSignupRequestOut(
+        **_to_list_item_out(request, approved_user=approved_user).model_dump()
+    )
 
 
 @router.post("/{request_id}/review", response_model=StudentSignupRequestReviewOut)
@@ -308,56 +594,49 @@ def review_student_signup_request(
         request.status = "rejected"
         db.commit()
         db.refresh(request)
-        return StudentSignupRequestReviewOut(
-            id=request.id,
-            status="rejected",
-            reviewed_at=request.reviewed_at,
-            reviewed_by_user_id=request.reviewed_by_user_id,
-            approved_user_id=None,
-            approved_student_id=None,
-            message="Solicitação rejeitada com sucesso.",
-        )
+        _send_rejected_email(request)
 
-    existing_user = db.scalar(select(User).where(User.email == request.email))
-    existing_student = db.scalar(select(Student).where(Student.email == request.email))
+        review_payload = {
+            "id": request.id,
+            "status": "rejected",
+            "reviewed_at": request.reviewed_at,
+            "reviewed_by_user_id": request.reviewed_by_user_id,
+            "approved_user_id": None,
+            "approved_student_id": None,
+            "email_confidence_status": "rejected",
+            "email_confirmed_at": None,
+            "message": "Solicitação rejeitada com sucesso.",
+        }
+        return StudentSignupRequestReviewOut(**review_payload)
 
-    if existing_student is None:
-        student = Student(
-            user_id=existing_user.id if existing_user is not None else None,
-            full_name=request.full_name,
-            email=request.email,
-            phone=request.whatsapp,
-            notes="Cadastro aprovado a partir de solicitação pública de aluno.",
-            profession=None,
-            instagram_handle=request.instagram,
-            share_profession=False,
-            share_instagram=False,
-            is_active=True,
-        )
-        db.add(student)
-        db.flush()
-    else:
-        student = existing_student
-        if student.user_id is None and existing_user is not None:
-            student.user_id = existing_user.id
-        if (not student.phone) and request.whatsapp:
-            student.phone = request.whatsapp
-        if (not student.instagram_handle) and request.instagram:
-            student.instagram_handle = request.instagram
+    user = _create_or_update_user_for_approved_request(db=db, request=request)
+    student = _create_or_update_student_for_approved_request(db=db, request=request, user=user)
 
     request.status = "approved"
-    request.approved_user_id = existing_user.id if existing_user is not None else None
+    request.approved_user_id = user.id
     request.approved_student_id = student.id
 
     db.commit()
     db.refresh(request)
+    db.refresh(user)
 
-    return StudentSignupRequestReviewOut(
-        id=request.id,
-        status="approved",
-        reviewed_at=request.reviewed_at,
-        reviewed_by_user_id=request.reviewed_by_user_id,
-        approved_user_id=request.approved_user_id,
-        approved_student_id=request.approved_student_id,
-        message="Solicitação aprovada com sucesso.",
-    )
+    _send_approved_email(db=db, request=request, user=user)
+
+    review_payload = {
+        "id": request.id,
+        "status": "approved",
+        "reviewed_at": request.reviewed_at,
+        "reviewed_by_user_id": request.reviewed_by_user_id,
+        "approved_user_id": request.approved_user_id,
+        "approved_student_id": request.approved_student_id,
+        "email_confidence_status": _resolve_email_confidence_status(
+            request=request,
+            approved_user=user,
+        ),
+        "email_confirmed_at": _resolve_email_confirmed_at(
+            request=request,
+            approved_user=user,
+        ),
+        "message": "Solicitação aprovada com sucesso.",
+    }
+    return StudentSignupRequestReviewOut(**review_payload)

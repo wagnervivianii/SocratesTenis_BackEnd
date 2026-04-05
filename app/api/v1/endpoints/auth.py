@@ -26,6 +26,7 @@ from app.models.user_identity import UserIdentity
 from app.schemas.auth import (
     CompleteGoogleProfileIn,
     CompleteGoogleProfileOut,
+    FirstAccessSetPasswordIn,
     ForgotPasswordRequestIn,
     GoogleAuthCallbackIn,
     GoogleAuthExchangeOut,
@@ -185,6 +186,11 @@ def _is_minor(birth_date: date) -> bool:
     return _calculate_age(birth_date) < 18
 
 
+def _is_student_like_role(role: str | None) -> bool:
+    value = (role or "").strip().lower()
+    return value in {"student", "aluno"}
+
+
 def _apply_guardian_fields(
     *,
     user: User,
@@ -283,13 +289,24 @@ def login(data: LoginIn, response: Response, db: DBSession):
                 },
             )
 
+        if _is_student_like_role(user.role):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "FIRST_ACCESS_PASSWORD_SETUP_REQUIRED",
+                    "message": (
+                        "Sua conta foi aprovada. Defina sua senha para concluir o primeiro acesso."
+                    ),
+                },
+            )
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
                 "code": "ACCOUNT_WITHOUT_PASSWORD",
                 "message": (
                     "Esta conta ainda não possui uma senha cadastrada. "
-                    "Use o método original de acesso ou redefina sua senha."
+                    "Use o método original de acesso ou conclua o cadastro antes de entrar."
                 ),
             },
         )
@@ -448,6 +465,132 @@ def complete_google_profile(
         user_id=str(user.id),
         profile_completed=_is_profile_completed(user),
         message="Perfil complementar atualizado com sucesso",
+    )
+
+
+@router.post("/first-access/set-password", response_model=MessageOut)
+def first_access_set_password(data: FirstAccessSetPasswordIn, db: DBSession):
+    raw_email = str(data.email).strip().lower() if data.email else ""
+    raw_token = (data.token or "").strip()
+
+    if not raw_email and not raw_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe o e-mail da conta ou utilize o link enviado para o primeiro acesso.",
+        )
+
+    user: User | None = None
+    svc = PasswordResetService(ttl_minutes=getattr(settings, "password_reset_ttl_minutes", 30))
+
+    if raw_token:
+        try:
+            user_id = svc.validate_token(db, raw_token)
+        except PasswordResetExpired:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "FIRST_ACCESS_TOKEN_EXPIRED",
+                    "message": "O link de primeiro acesso expirou. Solicite um novo link à escola.",
+                },
+            ) from None
+        except PasswordResetInvalid:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "FIRST_ACCESS_TOKEN_INVALID",
+                    "message": "O link de primeiro acesso é inválido ou já foi utilizado.",
+                },
+            ) from None
+
+        user = db.get(User, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="Conta não encontrada")
+
+        if raw_email and user.email != raw_email:
+            raise HTTPException(
+                status_code=400,
+                detail="O link informado não corresponde ao e-mail desta conta.",
+            )
+    else:
+        user = db.scalar(select(User).where(User.email == raw_email))
+
+    if not user:
+        raise HTTPException(status_code=404, detail="Conta não encontrada")
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="Sua conta ainda não está ativa. Aguarde a aprovação da escola.",
+        )
+
+    if user.password_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Esta conta já possui senha cadastrada. Use o login normal ou redefina sua senha."
+            ),
+        )
+
+    google_identity = _get_google_identity(db, user.id)
+    if google_identity is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Esta conta utiliza o fluxo de Google. Entre com Google para concluir o cadastro e definir sua senha."
+            ),
+        )
+
+    password_hash = get_password_hash(data.password)
+
+    if raw_token:
+        try:
+            consumed_user_id = svc.consume_token(db, raw_token, password_hash=password_hash)
+        except PasswordResetExpired:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "FIRST_ACCESS_TOKEN_EXPIRED",
+                    "message": "O link de primeiro acesso expirou. Solicite um novo link à escola.",
+                },
+            ) from None
+        except PasswordResetInvalid:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "FIRST_ACCESS_TOKEN_INVALID",
+                    "message": "O link de primeiro acesso é inválido ou já foi utilizado.",
+                },
+            ) from None
+
+        refreshed_user = db.get(User, consumed_user_id)
+        if not refreshed_user:
+            raise HTTPException(status_code=404, detail="Conta não encontrada")
+
+        refreshed_user.email_verified_at = refreshed_user.email_verified_at or datetime.now(UTC)
+        refreshed_user.updated_at = datetime.now(UTC)
+
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise HTTPException(
+                status_code=400,
+                detail="Não foi possível confirmar o e-mail e definir a senha do primeiro acesso.",
+            ) from None
+    else:
+        user.password_hash = password_hash
+
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise HTTPException(
+                status_code=400,
+                detail="Não foi possível definir a senha do primeiro acesso",
+            ) from None
+
+    return MessageOut(
+        message="Senha criada com sucesso. Agora você já pode entrar com seu e-mail e senha."
     )
 
 
@@ -691,6 +834,14 @@ def forgot_password(data: ForgotPasswordRequestIn, request: Request, db: DBSessi
                 message=(
                     "Esta conta foi criada com Google e ainda não possui senha. "
                     "Entre com Google para concluir o cadastro e definir sua senha."
+                )
+            )
+
+        if _is_student_like_role(user.role):
+            return MessageOut(
+                message=(
+                    "Sua conta foi aprovada, mas você ainda não definiu sua senha. "
+                    "Use o fluxo de primeiro acesso para criar sua senha."
                 )
             )
 

@@ -8,6 +8,12 @@ from pydantic import BaseModel, EmailStr, Field
 
 StudentSignupRequestStatus = Literal["pending", "approved", "rejected"]
 StudentSignupReviewAction = Literal["approve", "reject"]
+EmailConfidenceStatus = Literal[
+    "awaiting_review",
+    "pending_confirmation",
+    "confirmed",
+    "rejected",
+]
 
 
 class StudentSignupRequestCreateIn(BaseModel):
@@ -45,6 +51,8 @@ class StudentSignupRequestListItemOut(BaseModel):
     reviewed_by_user_id: UUID | None = None
     approved_user_id: UUID | None = None
     approved_student_id: UUID | None = None
+    email_confidence_status: EmailConfidenceStatus = "awaiting_review"
+    email_confirmed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -65,4 +73,6 @@ class StudentSignupRequestReviewOut(BaseModel):
     reviewed_by_user_id: UUID
     approved_user_id: UUID | None = None
     approved_student_id: UUID | None = None
+    email_confidence_status: EmailConfidenceStatus = "awaiting_review"
+    email_confirmed_at: datetime | None = None
     message: str

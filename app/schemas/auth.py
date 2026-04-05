@@ -90,3 +90,9 @@ class CompleteGoogleProfileIn(BaseModel):
 class CompleteGoogleProfileOut(BaseModel):
     message: str = "Perfil complementar atualizado com sucesso."
     profile_completed: bool = True
+
+
+class FirstAccessSetPasswordIn(BaseModel):
+    email: EmailStr | None = None
+    token: str | None = Field(default=None, min_length=20, max_length=1024)
+    password: str = Field(min_length=8, max_length=255)
