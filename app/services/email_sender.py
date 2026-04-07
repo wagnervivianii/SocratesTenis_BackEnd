@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import smtplib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Protocol
@@ -16,6 +17,14 @@ class SmtpConfig:
     use_tls: bool = True
 
 
+@dataclass(frozen=True)
+class InlineImage:
+    cid: str
+    data: bytes
+    content_type: str = "image/png"
+    filename: str | None = None
+
+
 class EmailSendError(RuntimeError):
     pass
 
@@ -28,6 +37,7 @@ class EmailSender(Protocol):
         subject: str,
         text_body: str,
         html_body: str | None = None,
+        inline_images: Sequence[InlineImage] | None = None,
     ) -> None: ...
 
     def send_verification_email(self, to_email: str, verify_link: str) -> None: ...
@@ -59,6 +69,7 @@ class BaseEmailSender:
         subject: str,
         text_body: str,
         html_body: str | None = None,
+        inline_images: Sequence[InlineImage] | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -239,6 +250,7 @@ class ConsoleEmailSender(BaseEmailSender):
         subject: str,
         text_body: str,
         html_body: str | None = None,
+        inline_images: Sequence[InlineImage] | None = None,
     ) -> None:
         print("[EMAIL][DEV]")
         print(f"to={to_email}")
@@ -247,6 +259,10 @@ class ConsoleEmailSender(BaseEmailSender):
         if html_body:
             print("[EMAIL][DEV][HTML]")
             print(html_body)
+        if inline_images:
+            print("[EMAIL][DEV][INLINE_IMAGES]")
+            for image in inline_images:
+                print(f"cid={image.cid} content_type={image.content_type} bytes={len(image.data)}")
 
 
 class SmtpEmailSender(BaseEmailSender):
@@ -260,6 +276,7 @@ class SmtpEmailSender(BaseEmailSender):
         subject: str,
         text_body: str,
         html_body: str | None = None,
+        inline_images: Sequence[InlineImage] | None = None,
     ) -> None:
         msg = EmailMessage()
         msg["Subject"] = subject
@@ -267,8 +284,22 @@ class SmtpEmailSender(BaseEmailSender):
         msg["To"] = to_email
 
         msg.set_content(text_body)
+        html_part: EmailMessage | None = None
         if html_body:
             msg.add_alternative(html_body, subtype="html")
+            html_part = msg.get_payload()[-1]
+
+        if html_part and inline_images:
+            for image in inline_images:
+                maintype, subtype = _split_content_type(image.content_type)
+                html_part.add_related(
+                    image.data,
+                    maintype=maintype,
+                    subtype=subtype,
+                    cid=f"<{image.cid}>",
+                    filename=image.filename or f"{image.cid}.{subtype}",
+                    disposition="inline",
+                )
 
         try:
             if self.cfg.use_tls:
@@ -284,3 +315,15 @@ class SmtpEmailSender(BaseEmailSender):
                     smtp.send_message(msg)
         except Exception as e:
             raise EmailSendError(f"Falha ao enviar e-mail: {e}") from e
+
+
+def _split_content_type(content_type: str) -> tuple[str, str]:
+    normalized = content_type.strip().lower()
+    if "/" not in normalized:
+        return "application", "octet-stream"
+
+    maintype, subtype = normalized.split("/", 1)
+    if not maintype or not subtype:
+        return "application", "octet-stream"
+
+    return maintype, subtype

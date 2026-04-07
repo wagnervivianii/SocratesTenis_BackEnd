@@ -7,7 +7,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -33,6 +33,9 @@ from app.schemas.trial_lessons import (
 )
 
 router = APIRouter(prefix="/trial-lessons", tags=["trial-lessons"])
+
+ADMIN_SCHEDULED_FROM_DATE_QUERY = Query(default=None)
+ADMIN_SCHEDULED_DAYS_QUERY = Query(default=14, ge=1, le=90)
 
 
 def _raise_trial_block(code: str, message: str) -> None:
@@ -143,6 +146,19 @@ class TrialLessonScheduleOut(BaseModel):
     message: str
 
 
+class TrialLessonAdminScheduleIn(TrialLessonScheduleIn):
+    user_id: UUID | None = None
+    full_name: str | None = Field(default=None, min_length=3, max_length=150)
+    email: EmailStr | None = None
+    whatsapp: str | None = Field(default=None, max_length=20)
+    instagram: str | None = Field(default=None, max_length=60)
+
+
+class TrialLessonAdminScheduleOut(TrialLessonScheduleOut):
+    target_user_id: UUID
+    user_created: bool = False
+
+
 class TrialLessonCurrentOut(BaseModel):
     scheduled: bool
     message: str
@@ -220,6 +236,37 @@ class TrialLessonAdminPendingListOut(BaseModel):
     message: str
 
 
+class TrialLessonAdminScheduledItemOut(BaseModel):
+    trial_lesson_id: str
+    user_id: str
+    event_id: str
+    status: str
+    start_at: datetime
+    end_at: datetime
+    court_id: UUID
+    court_name: str
+    teacher_id: UUID
+    teacher_name: str
+    user_name: str | None = None
+    user_email: str | None = None
+    user_whatsapp: str | None = None
+    notes: str | None = None
+    requested_at: datetime | None = None
+    scheduled_at: datetime | None = None
+    created_by_user_id: str | None = None
+    created_by_user_name: str | None = None
+    created_by_user_role: str | None = None
+    channel: str
+
+
+class TrialLessonAdminScheduledListOut(BaseModel):
+    items: list[TrialLessonAdminScheduledItemOut]
+    total: int
+    from_date: date
+    to_date: date
+    message: str
+
+
 class TrialLessonAttendanceReviewIn(BaseModel):
     outcome: Literal["completed", "no_show"]
     notes: str | None = Field(default=None, max_length=1000)
@@ -256,6 +303,67 @@ def _normalize_whatsapp(whatsapp: str | None) -> str | None:
         return None
     digits = "".join(ch for ch in whatsapp if ch.isdigit())
     return digits or None
+
+
+def _normalize_name(name: str | None, *, field_label: str = "Nome") -> str | None:
+    if name is None:
+        return None
+    value = " ".join(name.strip().split())
+    if not value:
+        return None
+    if len(value) < 3:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{field_label} inválido.",
+        )
+
+    for char in value:
+        if char.isspace():
+            continue
+        if not char.isalpha():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{field_label} deve conter apenas letras.",
+            )
+
+    return value.upper()
+
+
+def _normalize_instagram(instagram: str | None) -> str | None:
+    if not instagram:
+        return None
+    value = instagram.strip()
+    while value.startswith("@"):
+        value = value[1:]
+    value = value.strip().lower()
+    return value or None
+
+
+def _normalize_required_email(email: str | None) -> str:
+    value = _normalize_email(email)
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe um e-mail válido para concluir o agendamento assistido.",
+        )
+    return value
+
+
+def _normalize_required_whatsapp(whatsapp: str | None) -> str:
+    value = _normalize_whatsapp(whatsapp)
+    if not value or len(value) not in (10, 11):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe um WhatsApp válido com DDD para concluir o agendamento assistido.",
+        )
+    return value
+
+
+def _protected_non_student_role(role: str | None) -> bool:
+    value = (role or "").strip().lower()
+    if not value:
+        return False
+    return value.startswith("admin") or value in {"coach", "staff", "teacher", "professor", "prof"}
 
 
 def _get_user_or_404(db: Session, user_id: UUID) -> User:
@@ -860,6 +968,72 @@ def _get_trial_attendance_review_row(db: Session, trial_lesson_id: UUID):
     )
 
 
+def _list_admin_scheduled_rows(
+    db: Session,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  tl.id AS trial_lesson_id,
+                  tl.user_id AS user_id,
+                  tl.event_id AS event_id,
+                  tl.status AS status,
+                  tl.notes AS notes,
+                  tl.requested_at AS requested_at,
+                  tl.scheduled_at AS scheduled_at,
+                  ag.start_at AS start_at,
+                  ag.end_at AS end_at,
+                  ag.court_id AS court_id,
+                  ag.court_name AS court_name,
+                  ag.teacher_id AS teacher_id,
+                  ag.teacher_name AS teacher_name,
+                  u.full_name AS user_name,
+                  u.email AS user_email,
+                  u.whatsapp AS user_whatsapp,
+                  ev.created_by AS created_by_user_id,
+                  creator.full_name AS created_by_user_name,
+                  creator.role AS created_by_user_role,
+                  CASE
+                    WHEN ev.created_by IS NOT NULL AND COALESCE(LOWER(creator.role), '') LIKE 'admin%%'
+                      THEN 'admin_panel'
+                    ELSE 'user_portal'
+                  END AS channel
+                FROM public.trial_lessons tl
+                JOIN public.vw_agenda ag
+                  ON ag.event_id = tl.event_id
+                JOIN public.events ev
+                  ON ev.id = tl.event_id
+                JOIN public.users u
+                  ON u.id = tl.user_id
+                LEFT JOIN public.users creator
+                  ON creator.id = ev.created_by
+                WHERE tl.status = 'scheduled'
+                  AND ag.kind = 'primeira_aula'
+                  AND ag.status = 'confirmado'
+                  AND ag.start_at >= :start_at
+                  AND ag.start_at < :end_at
+                ORDER BY
+                  ag.start_at ASC,
+                  ag.court_name ASC,
+                  ag.teacher_name ASC,
+                  u.full_name ASC NULLS LAST
+                """
+            ),
+            {
+                "start_at": start_at,
+                "end_at": end_at,
+            },
+        )
+        .mappings()
+        .all()
+    )
+
+
 def _list_admin_pending_attendance_rows(db: Session):
     return (
         db.execute(
@@ -1249,6 +1423,95 @@ def _get_trial_control_state(db: Session, user: User):
     email = _normalize_email(user.email)
     whatsapp = _normalize_whatsapp(getattr(user, "whatsapp", None))
     return _find_trial_control(db, email, whatsapp)
+
+
+def _resolve_or_create_admin_trial_user(
+    db: Session,
+    data: TrialLessonAdminScheduleIn,
+) -> tuple[User, bool]:
+    if data.user_id is not None:
+        return _get_user_or_404(db, data.user_id), False
+
+    full_name = _normalize_name(data.full_name, field_label="Nome completo")
+    if not full_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe o nome completo para concluir o agendamento assistido.",
+        )
+
+    email = _normalize_required_email(str(data.email) if data.email is not None else None)
+    whatsapp = _normalize_required_whatsapp(data.whatsapp)
+    instagram = _normalize_instagram(data.instagram)
+
+    email_user = db.scalar(select(User).where(func.lower(User.email) == email))
+    whatsapp_user = db.scalar(select(User).where(User.whatsapp == whatsapp))
+
+    if email_user is not None and whatsapp_user is not None and email_user.id != whatsapp_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "TRIAL_ADMIN_CONTACT_CONFLICT",
+                "message": "O e-mail e o WhatsApp informados pertencem a cadastros diferentes. Revise os dados antes de agendar.",
+            },
+        )
+
+    user = email_user or whatsapp_user
+    if user is None:
+        user = User(
+            email=email,
+            password_hash=None,
+            full_name=full_name,
+            whatsapp=whatsapp,
+            instagram=instagram,
+            role="student",
+            is_active=True,
+            email_verified_at=None,
+        )
+        db.add(user)
+        db.flush()
+        return user, True
+
+    if _protected_non_student_role(user.role):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "TRIAL_ADMIN_PROTECTED_ACCOUNT",
+                "message": "Já existe uma conta institucional com estes dados. Revise manualmente antes de agendar a aula grátis.",
+            },
+        )
+
+    current_email = _normalize_email(user.email)
+    current_whatsapp = _normalize_whatsapp(user.whatsapp)
+
+    if current_email and current_email != email:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "TRIAL_ADMIN_EMAIL_CONFLICT",
+                "message": "O WhatsApp informado já pertence a um cadastro com outro e-mail. Revise os dados antes de agendar.",
+            },
+        )
+
+    if current_whatsapp and current_whatsapp != whatsapp:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "TRIAL_ADMIN_WHATSAPP_CONFLICT",
+                "message": "O e-mail informado já pertence a um cadastro com outro WhatsApp. Revise os dados antes de agendar.",
+            },
+        )
+
+    if not _normalize_name(user.full_name, field_label="Nome completo"):
+        user.full_name = full_name
+    if not current_whatsapp:
+        user.whatsapp = whatsapp
+    if not user.instagram and instagram:
+        user.instagram = instagram
+    user.is_active = True
+    if str(user.role or "").strip().lower() not in {"student", "aluno"}:
+        user.role = "student"
+
+    return user, False
 
 
 def _get_trial_block_reason(
@@ -1647,17 +1910,16 @@ def trial_lesson_slots(
     )
 
 
-@router.post(
-    "/schedule", response_model=TrialLessonScheduleOut, status_code=status.HTTP_201_CREATED
-)
-def schedule_trial_lesson(
+def _schedule_trial_lesson_for_user(
+    *,
+    db: Session,
+    owner_user: User,
+    actor_user: User,
     data: TrialLessonScheduleIn,
-    user_id: Annotated[str, Depends(get_current_user_id)],
-    db: Annotated[Session, Depends(get_db)],
-):
-    current_user = _get_user_or_404(db, UUID(user_id))
-
-    reason_code, message, _current_status = _get_trial_block_reason(db, current_user)
+    success_message: str,
+    default_event_note: str,
+) -> TrialLessonScheduleOut:
+    reason_code, message, _current_status = _get_trial_block_reason(db, owner_user)
     if reason_code is not None:
         _raise_trial_block(reason_code, message)
 
@@ -1725,29 +1987,27 @@ def schedule_trial_lesson(
                     "court_id": data.court_id,
                     "teacher_id": data.teacher_id,
                     "student_id": None,
-                    "created_by": current_user.id,
+                    "created_by": actor_user.id,
                     "kind": "primeira_aula",
                     "status": "confirmado",
                     "start_at": data.start_at,
                     "end_at": data.end_at,
-                    "notes": _normalize_notes(data.notes) or "Primeira aula agendada pelo portal.",
+                    "notes": _normalize_notes(data.notes) or default_event_note,
                 },
             )
             .mappings()
             .first()
         )
 
-        existing_requested = _get_latest_requested_trial(db, current_user.id)
-
-        if existing_requested:
-            existing_requested.event_id = event_row["id"]
-            existing_requested.status = "scheduled"
-            existing_requested.scheduled_at = data.start_at
-            existing_requested.notes = _normalize_notes(data.notes)
-            trial = existing_requested
+        trial = _get_latest_requested_trial(db, owner_user.id)
+        if trial:
+            trial.event_id = event_row["id"]
+            trial.status = "scheduled"
+            trial.scheduled_at = data.start_at
+            trial.notes = _normalize_notes(data.notes)
         else:
             trial = TrialLesson(
-                user_id=current_user.id,
+                user_id=owner_user.id,
                 event_id=event_row["id"],
                 status="scheduled",
                 scheduled_at=data.start_at,
@@ -1766,12 +2026,61 @@ def schedule_trial_lesson(
             end_at=event_row["end_at"],
             court_id=event_row["court_id"],
             teacher_id=event_row["teacher_id"],
-            message="Sua aula grátis foi agendada com sucesso.",
+            message=success_message,
         )
 
     except IntegrityError as e:
         db.rollback()
         raise _integrity_to_http(e) from e
+
+
+@router.post(
+    "/schedule", response_model=TrialLessonScheduleOut, status_code=status.HTTP_201_CREATED
+)
+def schedule_trial_lesson(
+    data: TrialLessonScheduleIn,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    current_user = _get_user_or_404(db, UUID(user_id))
+
+    return _schedule_trial_lesson_for_user(
+        db=db,
+        owner_user=current_user,
+        actor_user=current_user,
+        data=data,
+        success_message="Sua aula grátis foi agendada com sucesso.",
+        default_event_note="Primeira aula agendada pelo portal.",
+    )
+
+
+@router.post(
+    "/admin/schedule",
+    response_model=TrialLessonAdminScheduleOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def admin_schedule_trial_lesson(
+    data: TrialLessonAdminScheduleIn,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    admin_user = _require_admin_user(db, UUID(user_id))
+    target_user, user_created = _resolve_or_create_admin_trial_user(db, data)
+
+    scheduled = _schedule_trial_lesson_for_user(
+        db=db,
+        owner_user=target_user,
+        actor_user=admin_user,
+        data=data,
+        success_message="A aula grátis foi agendada com sucesso pelo painel administrativo.",
+        default_event_note="Primeira aula agendada pelo painel administrativo.",
+    )
+
+    return TrialLessonAdminScheduleOut(
+        **scheduled.model_dump(),
+        target_user_id=target_user.id,
+        user_created=user_created,
+    )
 
 
 @router.post("/cancel", response_model=TrialLessonCancelOut)
@@ -2041,6 +2350,68 @@ def reschedule_trial_lesson(
     except IntegrityError as e:
         db.rollback()
         raise _integrity_to_http(e) from e
+
+
+@router.get("/admin/scheduled", response_model=TrialLessonAdminScheduledListOut)
+def admin_list_scheduled_trial_lessons(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+    from_date: date | None = ADMIN_SCHEDULED_FROM_DATE_QUERY,
+    days: int = ADMIN_SCHEDULED_DAYS_QUERY,
+):
+    _require_admin_user(db, UUID(user_id))
+
+    tz = _local_tz()
+    start_day = from_date or datetime.now(tz).date()
+    end_day = start_day + timedelta(days=days)
+    start_at = datetime.combine(start_day, time.min, tzinfo=tz)
+    end_at = datetime.combine(end_day, time.min, tzinfo=tz)
+
+    rows = _list_admin_scheduled_rows(
+        db,
+        start_at=start_at,
+        end_at=end_at,
+    )
+
+    items = [
+        TrialLessonAdminScheduledItemOut(
+            trial_lesson_id=str(row["trial_lesson_id"]),
+            user_id=str(row["user_id"]),
+            event_id=str(row["event_id"]),
+            status=row["status"],
+            start_at=row["start_at"],
+            end_at=row["end_at"],
+            court_id=row["court_id"],
+            court_name=row["court_name"],
+            teacher_id=row["teacher_id"],
+            teacher_name=row["teacher_name"],
+            user_name=row["user_name"],
+            user_email=row["user_email"],
+            user_whatsapp=row["user_whatsapp"],
+            notes=row["notes"],
+            requested_at=row["requested_at"],
+            scheduled_at=row["scheduled_at"],
+            created_by_user_id=str(row["created_by_user_id"])
+            if row["created_by_user_id"]
+            else None,
+            created_by_user_name=row["created_by_user_name"],
+            created_by_user_role=row["created_by_user_role"],
+            channel=row["channel"],
+        )
+        for row in rows
+    ]
+
+    return TrialLessonAdminScheduledListOut(
+        items=items,
+        total=len(items),
+        from_date=start_day,
+        to_date=end_day - timedelta(days=1),
+        message=(
+            "Há aulas grátis agendadas dentro do período selecionado."
+            if items
+            else "Não há aulas grátis agendadas dentro do período selecionado."
+        ),
+    )
 
 
 @router.get("/admin/pending-attendance", response_model=TrialLessonAdminPendingListOut)

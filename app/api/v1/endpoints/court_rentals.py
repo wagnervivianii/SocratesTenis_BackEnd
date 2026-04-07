@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from html import escape
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
@@ -54,12 +55,16 @@ from app.schemas.court_rentals import (
 from app.services.email_sender import (
     ConsoleEmailSender,
     EmailSendError,
+    InlineImage,
     SmtpConfig,
     SmtpEmailSender,
 )
 from app.services.pix_payload import PixPayloadError, generate_pix_payload
 
 router = APIRouter(prefix="/court-rentals", tags=["court-rentals"])
+
+
+COURT_RENTAL_PRICING_PROFILES = {"student", "third_party"}
 
 
 def _integrity_to_http(e: IntegrityError) -> HTTPException:
@@ -127,6 +132,35 @@ def _normalize_optional_whatsapp(value: str | None) -> str | None:
         return None
     digits = "".join(ch for ch in cleaned if ch.isdigit())
     return digits or cleaned
+
+
+def _normalize_pricing_profile(value: str | None) -> str:
+    cleaned = (value or "third_party").strip().lower()
+    if cleaned not in COURT_RENTAL_PRICING_PROFILES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Perfil comercial de locação inválido.",
+        )
+    return cleaned
+
+
+def _resolve_setting_price_per_hour(
+    *, setting: dict[str, Any] | None, pricing_profile: str, origin: str
+) -> Decimal | None:
+    if not setting:
+        return None
+
+    normalized_origin = _normalize_optional_text(origin) or "admin_panel"
+    if pricing_profile == "student" or normalized_origin in {"student_portal", "admin_for_student"}:
+        value = setting.get("student_price_per_hour")
+    elif normalized_origin == "public_landing":
+        value = setting.get("public_third_party_price_per_hour")
+    else:
+        value = setting.get("admin_third_party_price_per_hour")
+
+    if value is None:
+        return None
+    return _quantize_money(Decimal(str(value)))
 
 
 def _normalize_email_for_match(value: str | None) -> str | None:
@@ -724,6 +758,32 @@ def _format_when_label(start_at: datetime, end_at: datetime) -> str:
     return f"{start_local.strftime('%d/%m/%Y')} das {start_local.strftime('%H:%M')} às {end_local.strftime('%H:%M')}"
 
 
+def _build_pix_qr_inline_image(pix_qr_code_payload: str | None) -> InlineImage | None:
+    normalized_payload = _normalize_optional_text(pix_qr_code_payload)
+    if not normalized_payload:
+        return None
+
+    try:
+        from io import BytesIO
+
+        import qrcode
+    except Exception:
+        return None
+
+    qr = qrcode.QRCode(border=1, box_size=6)
+    qr.add_data(normalized_payload)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return InlineImage(
+        cid="pix-qrcode",
+        data=buffer.getvalue(),
+        content_type="image/png",
+        filename="pix-qrcode.png",
+    )
+
+
 def _build_email_content(
     *,
     action: str,
@@ -734,10 +794,15 @@ def _build_email_content(
     total_amount: Decimal | None = None,
     pix_key: str | None = None,
     pix_qr_code_payload: str | None = None,
-) -> tuple[str, str, str]:
+    proof_whatsapp: str | None = None,
+    payment_instructions: str | None = None,
+) -> tuple[str, str, str, list[InlineImage]]:
     person_name = recipient_name or "cliente"
     when_label = _format_when_label(start_at, end_at)
     amount_label = f"R$ {total_amount:.2f}" if total_amount is not None else None
+    qr_inline_image = (
+        _build_pix_qr_inline_image(pix_qr_code_payload) if action == "payment_pending" else None
+    )
 
     if action == "scheduled":
         subject = "Sócrates Tênis — locação de quadra confirmada"
@@ -754,14 +819,21 @@ def _build_email_content(
     elif action == "payment_pending":
         subject = "Sócrates Tênis — pagamento pendente da locação"
         intro = "Recebemos sua solicitação de locação e ela está aguardando pagamento/comprovante."
-        parts = []
+        parts: list[str] = []
         if amount_label:
             parts.append(f"Valor previsto: {amount_label}")
+        if payment_instructions:
+            parts.append(payment_instructions)
         if pix_key:
             parts.append(f"Chave Pix: {pix_key}")
         if pix_qr_code_payload:
-            parts.append(f"Código Pix/QR: {pix_qr_code_payload}")
-        parts.append("Após o pagamento, envie o comprovante pelo WhatsApp indicado pela escola.")
+            parts.append(f"Código Pix copia e cola: {pix_qr_code_payload}")
+        if proof_whatsapp:
+            parts.append(f"Após o pagamento, envie o comprovante para {proof_whatsapp}.")
+        else:
+            parts.append(
+                "Após o pagamento, envie o comprovante pelo WhatsApp indicado pela escola."
+            )
         extra = "\n".join(parts)
     elif action == "proof_received":
         subject = "Sócrates Tênis — comprovante recebido"
@@ -795,22 +867,62 @@ def _build_email_content(
         + "Em caso de dúvida, entre em contato com a escola.\n"
     )
 
-    extra_html = f"<p>{extra.replace(chr(10), '<br/>')}</p>" if extra else ""
+    extra_html = f"<p>{escape(extra).replace(chr(10), '<br/>')}</p>" if extra else ""
+    qr_html = ""
+    inline_images: list[InlineImage] = []
+    if action == "payment_pending":
+        pix_blocks: list[str] = []
+        if amount_label:
+            pix_blocks.append(
+                f'<p style="margin:0 0 8px 0;"><strong>Valor previsto:</strong> {escape(amount_label)}</p>'
+            )
+        if payment_instructions:
+            pix_blocks.append(f'<p style="margin:0 0 8px 0;">{escape(payment_instructions)}</p>')
+        if pix_key:
+            pix_blocks.append(
+                f'<p style="margin:0 0 8px 0;"><strong>Chave Pix:</strong> {escape(pix_key)}</p>'
+            )
+        if pix_qr_code_payload:
+            pix_blocks.append(
+                '<div style="margin:12px 0;padding:12px;border:1px solid #dbeafe;border-radius:16px;background:#eff6ff;">'
+                '<p style="margin:0 0 8px 0;"><strong>Código Pix copia e cola</strong></p>'
+                f'<p style="margin:0;font-family:monospace;font-size:12px;word-break:break-all;">{escape(pix_qr_code_payload)}</p>'
+                "</div>"
+            )
+        if qr_inline_image:
+            inline_images.append(qr_inline_image)
+            qr_html = (
+                '<div style="margin:16px 0;padding:16px;border:1px solid #dbeafe;border-radius:20px;background:#ffffff;">'
+                '<p style="margin:0 0 12px 0;"><strong>QR Code Pix</strong></p>'
+                '<img src="cid:pix-qrcode" alt="QR Code Pix" style="display:block;width:220px;height:220px;max-width:100%;" />'
+                "</div>"
+            )
+        if proof_whatsapp:
+            pix_blocks.append(
+                f'<p style="margin:12px 0 0 0;">Após o pagamento, envie o comprovante para <strong>{escape(proof_whatsapp)}</strong>.</p>'
+            )
+        else:
+            pix_blocks.append(
+                '<p style="margin:12px 0 0 0;">Após o pagamento, envie o comprovante pelo WhatsApp indicado pela escola.</p>'
+            )
+        extra_html = "".join(pix_blocks)
+
     html_body = f"""
-    <div style=\"font-family:Arial,sans-serif;line-height:1.5\">
-      <h2>Sócrates Tênis</h2>
-      <p>Olá, <strong>{person_name}</strong>!</p>
-      <p>{intro}</p>
+    <div style="font-family:Arial,sans-serif;line-height:1.5;color:#0f172a;">
+      <h2 style="margin-bottom:8px;">Sócrates Tênis</h2>
+      <p>Olá, <strong>{escape(person_name)}</strong>!</p>
+      <p>{escape(intro)}</p>
       <ul>
-        <li><strong>Quadra:</strong> {court_name}</li>
-        <li><strong>Horário:</strong> {when_label}</li>
+        <li><strong>Quadra:</strong> {escape(court_name)}</li>
+        <li><strong>Horário:</strong> {escape(when_label)}</li>
       </ul>
       {extra_html}
+      {qr_html}
       <p>Em caso de dúvida, entre em contato com a escola.</p>
     </div>
     """
 
-    return subject, text_body, html_body
+    return subject, text_body, html_body, inline_images
 
 
 def _send_court_rental_email(
@@ -824,11 +936,13 @@ def _send_court_rental_email(
     total_amount: Decimal | None = None,
     pix_key: str | None = None,
     pix_qr_code_payload: str | None = None,
+    proof_whatsapp: str | None = None,
+    payment_instructions: str | None = None,
 ) -> bool:
     if not to_email:
         return False
 
-    subject, text_body, html_body = _build_email_content(
+    subject, text_body, html_body, inline_images = _build_email_content(
         action=action,
         recipient_name=recipient_name,
         start_at=start_at,
@@ -837,6 +951,8 @@ def _send_court_rental_email(
         total_amount=total_amount,
         pix_key=pix_key,
         pix_qr_code_payload=pix_qr_code_payload,
+        proof_whatsapp=proof_whatsapp,
+        payment_instructions=payment_instructions,
     )
 
     try:
@@ -846,6 +962,7 @@ def _send_court_rental_email(
             subject=subject,
             text_body=text_body,
             html_body=html_body,
+            inline_images=inline_images or None,
         )
         return True
     except EmailSendError:
@@ -862,6 +979,7 @@ def _serialize_rental(rental: CourtRental) -> CourtRentalOut:
         payment_reviewed_by_user_id=rental.payment_reviewed_by_user_id,
         event_id=rental.event_id,
         origin=rental.origin,
+        pricing_profile=rental.pricing_profile,
         status=rental.status,
         payment_status=rental.payment_status,
         customer_name=rental.customer_name,
@@ -1069,7 +1187,9 @@ def _get_active_court_rental_payment_setting_row(db: Session):
                   pix_key,
                   merchant_name,
                   merchant_city,
-                  default_price_per_hour,
+                  student_price_per_hour,
+                  public_third_party_price_per_hour,
+                  admin_third_party_price_per_hour,
                   proof_whatsapp,
                   payment_instructions,
                   is_active,
@@ -1088,6 +1208,17 @@ def _get_active_court_rental_payment_setting_row(db: Session):
     )
 
 
+def _get_payment_email_context(db: Session) -> tuple[str | None, str | None]:
+    setting = _get_active_court_rental_payment_setting_row(db)
+    if not setting:
+        return None, None
+
+    return (
+        _normalize_optional_whatsapp(setting.get("proof_whatsapp")),
+        _normalize_optional_text(setting.get("payment_instructions")),
+    )
+
+
 def _resolve_public_pending_payment_context(
     *,
     db: Session,
@@ -1102,7 +1233,16 @@ def _resolve_public_pending_payment_context(
         pix_qr_code_payload = f"PENDENTE_ADMIN::{court_name}::{when_label}"
         return None, None, None, pix_qr_code_payload
 
-    price_per_hour = _quantize_money(Decimal(str(setting["default_price_per_hour"])))
+    price_per_hour = _resolve_setting_price_per_hour(
+        setting=setting,
+        pricing_profile="third_party",
+        origin="public_landing",
+    )
+    if price_per_hour is None:
+        when_label = _format_when_label(start_at, end_at)
+        pix_qr_code_payload = f"PENDENTE_ADMIN::{court_name}::{when_label}"
+        return None, None, None, pix_qr_code_payload
+
     total_amount = _calculate_total_amount(start_at, end_at, price_per_hour)
     pix_key = str(setting["pix_key"]).strip()
 
@@ -1123,6 +1263,104 @@ def _resolve_public_pending_payment_context(
     return price_per_hour, total_amount, pix_key, pix_qr_code_payload
 
 
+def _resolve_admin_create_payment_context(
+    *,
+    db: Session,
+    pricing_profile: str,
+    origin: str,
+    court_name: str,
+    start_at: datetime,
+    end_at: datetime,
+    explicit_price_per_hour: Decimal | None,
+    explicit_total_amount: Decimal | None,
+    explicit_pix_key: str | None,
+    explicit_pix_qr_code_payload: str | None,
+) -> tuple[Decimal | None, Decimal | None, str | None, str | None]:
+    normalized_pix_key = _normalize_optional_text(explicit_pix_key)
+    normalized_pix_qr_code_payload = _normalize_optional_text(explicit_pix_qr_code_payload)
+    setting = _get_active_court_rental_payment_setting_row(db)
+
+    has_explicit_override = any(
+        value is not None
+        for value in [
+            explicit_price_per_hour,
+            explicit_total_amount,
+            normalized_pix_key,
+            normalized_pix_qr_code_payload,
+        ]
+    )
+
+    if has_explicit_override:
+        price_per_hour = (
+            _quantize_money(Decimal(str(explicit_price_per_hour)))
+            if explicit_price_per_hour is not None
+            else None
+        )
+        total_amount = (
+            _quantize_money(Decimal(str(explicit_total_amount)))
+            if explicit_total_amount is not None
+            else (
+                _calculate_total_amount(start_at, end_at, price_per_hour)
+                if price_per_hour is not None
+                else None
+            )
+        )
+        resolved_pix_key = normalized_pix_key
+        merchant_name = None
+        merchant_city = None
+        if setting:
+            if resolved_pix_key is None:
+                resolved_pix_key = _normalize_optional_text(str(setting.get("pix_key") or ""))
+            merchant_name = _normalize_optional_text(str(setting.get("merchant_name") or ""))
+            merchant_city = _normalize_optional_text(str(setting.get("merchant_city") or ""))
+
+        pix_qr_code_payload = normalized_pix_qr_code_payload
+        if (
+            pix_qr_code_payload is None
+            and resolved_pix_key is not None
+            and total_amount is not None
+            and merchant_name
+            and merchant_city
+        ):
+            pix_qr_code_payload = _build_admin_pix_payload(
+                pix_key=resolved_pix_key,
+                total_amount=total_amount,
+                court_name=court_name,
+                start_at=start_at,
+                end_at=end_at,
+                merchant_name=merchant_name,
+                merchant_city=merchant_city,
+            )
+        return price_per_hour, total_amount, resolved_pix_key, pix_qr_code_payload
+
+    if not setting:
+        return None, None, None, None
+
+    price_per_hour = _resolve_setting_price_per_hour(
+        setting=setting,
+        pricing_profile=pricing_profile,
+        origin=origin,
+    )
+    if price_per_hour is None:
+        return None, None, None, None
+
+    total_amount = _calculate_total_amount(start_at, end_at, price_per_hour)
+    pix_key = _normalize_optional_text(str(setting["pix_key"]))
+    if not pix_key:
+        return price_per_hour, total_amount, None, None
+
+    pix_qr_code_payload = _build_admin_pix_payload(
+        pix_key=pix_key,
+        total_amount=total_amount,
+        court_name=court_name,
+        start_at=start_at,
+        end_at=end_at,
+        merchant_name=str(setting["merchant_name"]).strip(),
+        merchant_city=str(setting["merchant_city"]).strip(),
+    )
+    return price_per_hour, total_amount, pix_key, pix_qr_code_payload
+
+
 def _get_owned_rental_any_status_row(db: Session, owner_user_id: UUID, rental_id: UUID):
     return (
         db.execute(
@@ -1134,6 +1372,7 @@ def _get_owned_rental_any_status_row(db: Session, owner_user_id: UUID, rental_id
                   cr.status AS status,
                   cr.payment_status AS payment_status,
                   cr.origin AS origin,
+                  cr.pricing_profile AS pricing_profile,
                   cr.customer_name AS customer_name,
                   cr.customer_email AS customer_email,
                   cr.customer_whatsapp AS customer_whatsapp,
@@ -1187,6 +1426,7 @@ def _get_upcoming_rental_rows(db: Session, owner_user_id: UUID):
                   cr.status AS status,
                   cr.payment_status AS payment_status,
                   cr.origin AS origin,
+                  cr.pricing_profile AS pricing_profile,
                   cr.customer_name AS customer_name,
                   cr.customer_email AS customer_email,
                   cr.customer_whatsapp AS customer_whatsapp,
@@ -1226,6 +1466,7 @@ def _get_rental_history_rows(db: Session, owner_user_id: UUID):
                   cr.status AS status,
                   cr.payment_status AS payment_status,
                   cr.origin AS origin,
+                  cr.pricing_profile AS pricing_profile,
                   cr.customer_name AS customer_name,
                   cr.customer_email AS customer_email,
                   cr.customer_whatsapp AS customer_whatsapp,
@@ -1314,6 +1555,7 @@ def _get_owned_rental_row(db: Session, owner_user_id: UUID, rental_id: UUID):
                   cr.status AS status,
                   cr.payment_status AS payment_status,
                   cr.origin AS origin,
+                  cr.pricing_profile AS pricing_profile,
                   cr.customer_name AS customer_name,
                   cr.customer_email AS customer_email,
                   cr.customer_whatsapp AS customer_whatsapp,
@@ -1355,6 +1597,7 @@ def _get_admin_rental_row(db: Session, rental_id: UUID):
                   cr.id,
                   cr.event_id,
                   cr.origin,
+                  cr.pricing_profile,
                   cr.status,
                   cr.payment_status,
                   cr.customer_name,
@@ -1521,6 +1764,7 @@ def upcoming_court_rentals(
                 status=row["status"],
                 payment_status=row["payment_status"],
                 origin=row["origin"],
+                pricing_profile=row["pricing_profile"],
                 start_at=row["start_at"],
                 end_at=row["end_at"],
                 court_id=row["court_id"],
@@ -1742,6 +1986,7 @@ def get_court_rental_payment_instructions(
 
     return CourtRentalPaymentInstructionOut(
         rental_id=row["rental_id"],
+        pricing_profile=row["pricing_profile"],
         payment_status=row["payment_status"],
         total_amount=row["total_amount"],
         pix_key=row["pix_key"],
@@ -1820,6 +2065,7 @@ def schedule_court_rental(
             customer_whatsapp=_normalize_optional_whatsapp(current_user.whatsapp),
             event_id=event_row["id"],
             origin="public_landing",
+            pricing_profile="third_party",
             status="awaiting_payment",
             payment_status="pending",
             payment_expires_at=_calculate_public_payment_expires_at(),
@@ -1838,6 +2084,7 @@ def schedule_court_rental(
         db.rollback()
         raise _integrity_to_http(e) from e
 
+    proof_whatsapp, payment_instructions = _get_payment_email_context(db)
     email_sent = _send_court_rental_email(
         to_email=current_user.email,
         recipient_name=current_user.full_name,
@@ -1848,6 +2095,8 @@ def schedule_court_rental(
         total_amount=total_amount,
         pix_key=pix_key,
         pix_qr_code_payload=pix_qr_code_payload,
+        proof_whatsapp=proof_whatsapp,
+        payment_instructions=payment_instructions,
     )
     _mark_confirmation_email_if_sent(db, rental, email_sent)
 
@@ -1866,6 +2115,7 @@ def schedule_court_rental(
         status=rental.status,
         payment_status=rental.payment_status,
         origin=rental.origin,
+        pricing_profile=rental.pricing_profile,
         start_at=event_row["start_at"],
         end_at=event_row["end_at"],
         court_id=event_row["court_id"],
@@ -2000,6 +2250,7 @@ def submit_court_rental_payment_proof(
 
     return CourtRentalProofSubmissionOut(
         rental_id=rental.id,
+        pricing_profile=rental.pricing_profile,
         status=rental.status,
         payment_status=rental.payment_status,
         payment_proof_submitted_at=rental.payment_proof_submitted_at,
@@ -2215,6 +2466,7 @@ def cancel_court_rental(
     return CourtRentalCancelOut(
         rental_id=rental.id,
         event_id=row["event_id"],
+        pricing_profile=rental.pricing_profile,
         status=rental.status,
         payment_status=rental.payment_status,
         message=message,
@@ -2321,6 +2573,7 @@ def reschedule_court_rental(
         rental_id=rental.id,
         old_event_id=old_event_id,
         new_event_id=new_event_row["id"],
+        pricing_profile=rental.pricing_profile,
         status=rental.status,
         payment_status=rental.payment_status,
         start_at=new_event_row["start_at"],
@@ -2340,6 +2593,7 @@ def admin_list_court_rentals(
     status_filter: Annotated[str | None, Query(alias="status")] = None,
     payment_status_filter: Annotated[str | None, Query(alias="payment_status")] = None,
     origin: Annotated[str | None, Query()] = None,
+    pricing_profile: Annotated[str | None, Query()] = None,
 ):
     _require_admin(db, user_id)
     _expire_overdue_public_pending_rentals(db)
@@ -2364,6 +2618,9 @@ def admin_list_court_rentals(
     if origin:
         where_parts.append("cr.origin = :origin")
         params["origin"] = origin
+    if pricing_profile:
+        where_parts.append("cr.pricing_profile = :pricing_profile")
+        params["pricing_profile"] = _normalize_pricing_profile(pricing_profile)
 
     rows = (
         db.execute(
@@ -2372,6 +2629,7 @@ def admin_list_court_rentals(
                 SELECT
                   cr.id,
                   cr.origin,
+                  cr.pricing_profile,
                   cr.status,
                   cr.payment_status,
                   e.court_id,
@@ -2539,6 +2797,7 @@ def admin_define_court_rental_payment(
     db.commit()
     db.refresh(rental)
 
+    proof_whatsapp, payment_instructions = _get_payment_email_context(db)
     email_sent = _send_court_rental_email(
         to_email=rental.customer_email,
         recipient_name=rental.customer_name,
@@ -2549,6 +2808,8 @@ def admin_define_court_rental_payment(
         total_amount=rental.total_amount,
         pix_key=rental.pix_key,
         pix_qr_code_payload=rental.pix_qr_code_payload,
+        proof_whatsapp=proof_whatsapp,
+        payment_instructions=payment_instructions,
     )
     _mark_confirmation_email_if_sent(db, rental, email_sent)
 
@@ -2560,6 +2821,7 @@ def admin_define_court_rental_payment(
 
     return CourtRentalAdminPaymentDefinitionOut(
         rental_id=rental.id,
+        pricing_profile=rental.pricing_profile,
         status=rental.status,
         payment_status=rental.payment_status,
         price_per_hour=rental.price_per_hour,
@@ -2603,9 +2865,53 @@ def admin_create_court_rental(
         customer_email=data.customer_email,
         customer_whatsapp=data.customer_whatsapp,
     )
-    status_value, payment_status_value, confirmed_at_value = (
-        _resolve_payment_state_for_admin_create(data)
+    pricing_profile = _normalize_pricing_profile(data.pricing_profile)
+    if pricing_profile == "student" and customer["customer_student_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Para usar a tarifa de aluno, selecione um aluno vinculado.",
+        )
+
+    court_name = _get_court_name(db, data.court_id)
+    (
+        resolved_price_per_hour,
+        resolved_total_amount,
+        resolved_pix_key,
+        resolved_pix_qr_code_payload,
+    ) = _resolve_admin_create_payment_context(
+        db=db,
+        pricing_profile=pricing_profile,
+        origin=data.origin,
+        court_name=court_name,
+        start_at=data.start_at,
+        end_at=data.end_at,
+        explicit_price_per_hour=data.price_per_hour,
+        explicit_total_amount=data.total_amount,
+        explicit_pix_key=data.pix_key,
+        explicit_pix_qr_code_payload=data.pix_qr_code_payload,
     )
+
+    payment_context_present = all(
+        value is not None
+        for value in [
+            resolved_price_per_hour,
+            resolved_total_amount,
+            resolved_pix_key,
+            resolved_pix_qr_code_payload,
+        ]
+    )
+    if not payment_context_present:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "ADMIN_RENTAL_PIX_SETTING_REQUIRED",
+                "message": "Defina o valor da locação com uma configuração Pix ativa para gerar a cobrança completa antes de salvar.",
+            },
+        )
+
+    status_value = "awaiting_payment"
+    payment_status_value = "pending"
+    confirmed_at_value = None
 
     try:
         event_row = _create_event(
@@ -2624,15 +2930,16 @@ def admin_create_court_rental(
             customer_student_id=customer["customer_student_id"],
             event_id=event_row["id"],
             origin=data.origin,
+            pricing_profile=pricing_profile,
             status=status_value,
             payment_status=payment_status_value,
             customer_name=customer["customer_name"],
             customer_email=customer["customer_email"],
             customer_whatsapp=customer["customer_whatsapp"],
-            price_per_hour=data.price_per_hour,
-            total_amount=data.total_amount,
-            pix_key=_normalize_optional_text(data.pix_key),
-            pix_qr_code_payload=_normalize_optional_text(data.pix_qr_code_payload),
+            price_per_hour=resolved_price_per_hour,
+            total_amount=resolved_total_amount,
+            pix_key=resolved_pix_key,
+            pix_qr_code_payload=resolved_pix_qr_code_payload,
             scheduled_at=data.start_at,
             confirmed_at=confirmed_at_value,
             notes=_normalize_notes(data.notes),
@@ -2644,7 +2951,7 @@ def admin_create_court_rental(
         db.rollback()
         raise _integrity_to_http(e) from e
 
-    court_name = _get_court_name(db, data.court_id)
+    proof_whatsapp, payment_instructions = _get_payment_email_context(db)
     email_action = "payment_pending" if rental.payment_status == "pending" else "scheduled"
     email_sent = _send_court_rental_email(
         to_email=rental.customer_email,
@@ -2656,6 +2963,8 @@ def admin_create_court_rental(
         total_amount=rental.total_amount,
         pix_key=rental.pix_key,
         pix_qr_code_payload=rental.pix_qr_code_payload,
+        proof_whatsapp=proof_whatsapp,
+        payment_instructions=payment_instructions,
     )
     _mark_confirmation_email_if_sent(db, rental, email_sent)
 
@@ -2697,6 +3006,19 @@ def admin_update_court_rental(
         rental.customer_name = customer["customer_name"]
         rental.customer_email = customer["customer_email"]
         rental.customer_whatsapp = customer["customer_whatsapp"]
+
+    if "pricing_profile" in payload and payload["pricing_profile"] is not None:
+        normalized_pricing_profile = _normalize_pricing_profile(payload["pricing_profile"])
+        if (
+            normalized_pricing_profile == "student"
+            and rental.customer_student_id is None
+            and payload.get("customer_student_id", rental.customer_student_id) is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Para usar a tarifa de aluno, selecione um aluno vinculado.",
+            )
+        rental.pricing_profile = normalized_pricing_profile
 
     if "price_per_hour" in payload:
         rental.price_per_hour = payload["price_per_hour"]
@@ -2825,6 +3147,7 @@ def admin_review_court_rental_payment(
 
     return CourtRentalPaymentReviewOut(
         rental_id=rental.id,
+        pricing_profile=rental.pricing_profile,
         status=rental.status,
         payment_status=rental.payment_status,
         payment_reviewed_at=rental.payment_reviewed_at,

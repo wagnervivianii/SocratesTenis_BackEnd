@@ -69,6 +69,13 @@ class CourtRental(Base):
         index=True,
     )
 
+    pricing_profile: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'third_party'"),
+        index=True,
+    )
+
     status: Mapped[str] = mapped_column(
         Text,
         nullable=False,

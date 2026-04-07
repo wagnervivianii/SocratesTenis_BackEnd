@@ -19,6 +19,40 @@ from app.schemas.court_rental_payment_settings import (
 
 router = APIRouter(prefix="/court-rental-payment-settings", tags=["court-rental-payment-settings"])
 
+_SETTING_COLUMNS = """
+  id,
+  created_by_user_id,
+  updated_by_user_id,
+  name,
+  pix_key,
+  merchant_name,
+  merchant_city,
+  student_price_per_hour,
+  public_third_party_price_per_hour,
+  admin_third_party_price_per_hour,
+  proof_whatsapp,
+  payment_instructions,
+  is_active,
+  notes,
+  created_at,
+  updated_at
+"""
+
+_SUMMARY_COLUMNS = """
+  id,
+  name,
+  pix_key,
+  merchant_name,
+  merchant_city,
+  student_price_per_hour,
+  public_third_party_price_per_hour,
+  admin_third_party_price_per_hour,
+  proof_whatsapp,
+  payment_instructions,
+  is_active,
+  updated_at
+"""
+
 
 def _get_current_user_row(db: Session, user_id: str):
     return (
@@ -97,22 +131,9 @@ def _get_setting_or_404(db: Session, setting_id: UUID):
     row = (
         db.execute(
             text(
-                """
+                f"""
                 SELECT
-                  id,
-                  created_by_user_id,
-                  updated_by_user_id,
-                  name,
-                  pix_key,
-                  merchant_name,
-                  merchant_city,
-                  default_price_per_hour,
-                  proof_whatsapp,
-                  payment_instructions,
-                  is_active,
-                  notes,
-                  created_at,
-                  updated_at
+{_SETTING_COLUMNS}
                 FROM public.court_rental_payment_settings
                 WHERE id = :setting_id
                 """
@@ -142,22 +163,9 @@ def get_current_court_rental_payment_setting(
     row = (
         db.execute(
             text(
-                """
+                f"""
                 SELECT
-                  id,
-                  created_by_user_id,
-                  updated_by_user_id,
-                  name,
-                  pix_key,
-                  merchant_name,
-                  merchant_city,
-                  default_price_per_hour,
-                  proof_whatsapp,
-                  payment_instructions,
-                  is_active,
-                  notes,
-                  created_at,
-                  updated_at
+{_SETTING_COLUMNS}
                 FROM public.court_rental_payment_settings
                 WHERE is_active = true
                 ORDER BY created_at DESC
@@ -187,18 +195,9 @@ def list_court_rental_payment_settings(
 
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT
-              id,
-              name,
-              pix_key,
-              merchant_name,
-              merchant_city,
-              default_price_per_hour,
-              proof_whatsapp,
-              payment_instructions,
-              is_active,
-              updated_at
+{_SUMMARY_COLUMNS}
             FROM public.court_rental_payment_settings
             ORDER BY is_active DESC, updated_at DESC, created_at DESC
             """
@@ -222,7 +221,7 @@ def create_court_rental_payment_setting(
         row = (
             db.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO public.court_rental_payment_settings (
                       created_by_user_id,
                       updated_by_user_id,
@@ -230,7 +229,9 @@ def create_court_rental_payment_setting(
                       pix_key,
                       merchant_name,
                       merchant_city,
-                      default_price_per_hour,
+                      student_price_per_hour,
+                      public_third_party_price_per_hour,
+                      admin_third_party_price_per_hour,
                       proof_whatsapp,
                       payment_instructions,
                       is_active,
@@ -243,27 +244,16 @@ def create_court_rental_payment_setting(
                       :pix_key,
                       :merchant_name,
                       :merchant_city,
-                      :default_price_per_hour,
+                      :student_price_per_hour,
+                      :public_third_party_price_per_hour,
+                      :admin_third_party_price_per_hour,
                       :proof_whatsapp,
                       :payment_instructions,
                       :is_active,
                       :notes
                     )
                     RETURNING
-                      id,
-                      created_by_user_id,
-                      updated_by_user_id,
-                      name,
-                      pix_key,
-                      merchant_name,
-                      merchant_city,
-                      default_price_per_hour,
-                      proof_whatsapp,
-                      payment_instructions,
-                      is_active,
-                      notes,
-                      created_at,
-                      updated_at
+{_SETTING_COLUMNS}
                     """
                 ),
                 {
@@ -273,7 +263,9 @@ def create_court_rental_payment_setting(
                     "pix_key": data["pix_key"].strip(),
                     "merchant_name": data["merchant_name"].strip().upper(),
                     "merchant_city": data["merchant_city"].strip().upper(),
-                    "default_price_per_hour": data["default_price_per_hour"],
+                    "student_price_per_hour": data["student_price_per_hour"],
+                    "public_third_party_price_per_hour": data["public_third_party_price_per_hour"],
+                    "admin_third_party_price_per_hour": data["admin_third_party_price_per_hour"],
                     "proof_whatsapp": data["proof_whatsapp"].strip()
                     if data["proof_whatsapp"]
                     else None,
@@ -315,8 +307,14 @@ def update_court_rental_payment_setting(
         "pix_key": data.get("pix_key", existing["pix_key"]),
         "merchant_name": data.get("merchant_name", existing["merchant_name"]),
         "merchant_city": data.get("merchant_city", existing["merchant_city"]),
-        "default_price_per_hour": data.get(
-            "default_price_per_hour", existing["default_price_per_hour"]
+        "student_price_per_hour": data.get(
+            "student_price_per_hour", existing["student_price_per_hour"]
+        ),
+        "public_third_party_price_per_hour": data.get(
+            "public_third_party_price_per_hour", existing["public_third_party_price_per_hour"]
+        ),
+        "admin_third_party_price_per_hour": data.get(
+            "admin_third_party_price_per_hour", existing["admin_third_party_price_per_hour"]
         ),
         "proof_whatsapp": data.get("proof_whatsapp", existing["proof_whatsapp"]),
         "payment_instructions": data.get("payment_instructions", existing["payment_instructions"]),
@@ -328,7 +326,7 @@ def update_court_rental_payment_setting(
         row = (
             db.execute(
                 text(
-                    """
+                    f"""
                     UPDATE public.court_rental_payment_settings
                     SET
                       updated_by_user_id = :updated_by_user_id,
@@ -336,7 +334,9 @@ def update_court_rental_payment_setting(
                       pix_key = :pix_key,
                       merchant_name = :merchant_name,
                       merchant_city = :merchant_city,
-                      default_price_per_hour = :default_price_per_hour,
+                      student_price_per_hour = :student_price_per_hour,
+                      public_third_party_price_per_hour = :public_third_party_price_per_hour,
+                      admin_third_party_price_per_hour = :admin_third_party_price_per_hour,
                       proof_whatsapp = :proof_whatsapp,
                       payment_instructions = :payment_instructions,
                       is_active = :is_active,
@@ -344,20 +344,7 @@ def update_court_rental_payment_setting(
                       updated_at = now()
                     WHERE id = :setting_id
                     RETURNING
-                      id,
-                      created_by_user_id,
-                      updated_by_user_id,
-                      name,
-                      pix_key,
-                      merchant_name,
-                      merchant_city,
-                      default_price_per_hour,
-                      proof_whatsapp,
-                      payment_instructions,
-                      is_active,
-                      notes,
-                      created_at,
-                      updated_at
+{_SETTING_COLUMNS}
                     """
                 ),
                 {
@@ -375,7 +362,11 @@ def update_court_rental_payment_setting(
                     "merchant_city": merged["merchant_city"].strip().upper()
                     if isinstance(merged["merchant_city"], str)
                     else merged["merchant_city"],
-                    "default_price_per_hour": merged["default_price_per_hour"],
+                    "student_price_per_hour": merged["student_price_per_hour"],
+                    "public_third_party_price_per_hour": merged[
+                        "public_third_party_price_per_hour"
+                    ],
+                    "admin_third_party_price_per_hour": merged["admin_third_party_price_per_hour"],
                     "proof_whatsapp": merged["proof_whatsapp"].strip()
                     if isinstance(merged["proof_whatsapp"], str) and merged["proof_whatsapp"]
                     else None,
@@ -428,7 +419,7 @@ def activate_court_rental_payment_setting(
         row = (
             db.execute(
                 text(
-                    """
+                    f"""
                     UPDATE public.court_rental_payment_settings
                     SET
                       is_active = true,
@@ -436,20 +427,7 @@ def activate_court_rental_payment_setting(
                       updated_at = now()
                     WHERE id = :setting_id
                     RETURNING
-                      id,
-                      created_by_user_id,
-                      updated_by_user_id,
-                      name,
-                      pix_key,
-                      merchant_name,
-                      merchant_city,
-                      default_price_per_hour,
-                      proof_whatsapp,
-                      payment_instructions,
-                      is_active,
-                      notes,
-                      created_at,
-                      updated_at
+{_SETTING_COLUMNS}
                     """
                 ),
                 {"user_id": user_id, "setting_id": setting_id},

@@ -14,6 +14,11 @@ CourtRentalOrigin = Literal[
     "admin_for_student",
 ]
 
+CourtRentalPricingProfile = Literal[
+    "student",
+    "third_party",
+]
+
 CourtRentalStatus = Literal[
     "requested",
     "awaiting_payment",
@@ -85,6 +90,7 @@ class CourtRentalAdminCreateIn(BaseModel):
     start_at: datetime
     end_at: datetime
     origin: CourtRentalOrigin = "admin_panel"
+    pricing_profile: CourtRentalPricingProfile = "third_party"
     customer_user_id: UUID | None = None
     customer_student_id: UUID | None = None
     customer_name: str | None = Field(default=None, min_length=3, max_length=150)
@@ -98,6 +104,7 @@ class CourtRentalAdminCreateIn(BaseModel):
 
 
 class CourtRentalAdminUpdateIn(BaseModel):
+    pricing_profile: CourtRentalPricingProfile | None = None
     customer_user_id: UUID | None = None
     customer_student_id: UUID | None = None
     customer_name: str | None = Field(default=None, min_length=3, max_length=150)
@@ -122,6 +129,7 @@ class CourtRentalAdminPaymentDefinitionIn(BaseModel):
 
 class CourtRentalAdminPaymentDefinitionOut(BaseModel):
     rental_id: UUID
+    pricing_profile: CourtRentalPricingProfile | None = None
     status: str
     payment_status: str
     price_per_hour: Decimal | None = None
@@ -144,6 +152,7 @@ class CourtRentalProofSubmissionIn(BaseModel):
 
 class CourtRentalProofSubmissionOut(BaseModel):
     rental_id: UUID
+    pricing_profile: CourtRentalPricingProfile | None = None
     status: str
     payment_status: str
     payment_proof_submitted_at: datetime | None = None
@@ -166,6 +175,7 @@ class CourtRentalPaymentReviewIn(BaseModel):
 
 class CourtRentalPaymentReviewOut(BaseModel):
     rental_id: UUID
+    pricing_profile: CourtRentalPricingProfile | None = None
     status: str
     payment_status: str
     payment_reviewed_at: datetime | None = None
@@ -182,6 +192,7 @@ class CourtRentalScheduleOut(BaseModel):
     status: str
     payment_status: str | None = None
     origin: str | None = None
+    pricing_profile: CourtRentalPricingProfile | None = None
     start_at: datetime
     end_at: datetime
     court_id: UUID
@@ -195,6 +206,7 @@ class CourtRentalUpcomingItemOut(BaseModel):
     status: str
     payment_status: str | None = None
     origin: str | None = None
+    pricing_profile: CourtRentalPricingProfile | None = None
     start_at: datetime
     end_at: datetime
     court_id: UUID
@@ -221,6 +233,7 @@ class CourtRentalHistoryItemOut(BaseModel):
     status: str
     payment_status: str | None = None
     origin: str | None = None
+    pricing_profile: CourtRentalPricingProfile | None = None
     start_at: datetime | None = None
     end_at: datetime | None = None
     court_id: UUID | None = None
@@ -253,6 +266,7 @@ class CourtRentalHistoryListOut(BaseModel):
 class CourtRentalCancelOut(BaseModel):
     rental_id: UUID
     event_id: UUID
+    pricing_profile: CourtRentalPricingProfile | None = None
     status: str
     payment_status: str | None = None
     message: str
@@ -270,6 +284,7 @@ class CourtRentalRescheduleOut(BaseModel):
     rental_id: UUID
     old_event_id: UUID
     new_event_id: UUID
+    pricing_profile: CourtRentalPricingProfile | None = None
     status: str
     payment_status: str | None = None
     start_at: datetime
@@ -281,6 +296,7 @@ class CourtRentalRescheduleOut(BaseModel):
 
 class CourtRentalPaymentInstructionOut(BaseModel):
     rental_id: UUID
+    pricing_profile: CourtRentalPricingProfile | None = None
     payment_status: str
     total_amount: Decimal | None = None
     pix_key: str | None = None
@@ -298,6 +314,7 @@ class CourtRentalOut(BaseModel):
     payment_reviewed_by_user_id: UUID | None = None
     event_id: UUID | None = None
     origin: str
+    pricing_profile: CourtRentalPricingProfile
     status: str
     payment_status: str
     customer_name: str | None = None
@@ -327,6 +344,7 @@ class CourtRentalOut(BaseModel):
 class CourtRentalAdminListItemOut(BaseModel):
     id: UUID
     origin: str
+    pricing_profile: CourtRentalPricingProfile
     status: str
     payment_status: str
     court_id: UUID | None = None

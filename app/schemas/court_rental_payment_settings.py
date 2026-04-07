@@ -12,7 +12,9 @@ class CourtRentalPaymentSettingBase(BaseModel):
     pix_key: str = Field(..., min_length=1, max_length=255)
     merchant_name: str = Field(default="SOCRATES TENIS", min_length=1, max_length=255)
     merchant_city: str = Field(default="SAO PAULO", min_length=1, max_length=255)
-    default_price_per_hour: Decimal = Field(..., gt=0)
+    student_price_per_hour: Decimal = Field(..., gt=0)
+    public_third_party_price_per_hour: Decimal = Field(..., gt=0)
+    admin_third_party_price_per_hour: Decimal = Field(..., gt=0)
     proof_whatsapp: str | None = Field(default=None, max_length=40)
     payment_instructions: str | None = Field(default=None, max_length=2000)
     is_active: bool = True
@@ -28,7 +30,9 @@ class CourtRentalPaymentSettingUpdateIn(BaseModel):
     pix_key: str | None = Field(default=None, min_length=1, max_length=255)
     merchant_name: str | None = Field(default=None, min_length=1, max_length=255)
     merchant_city: str | None = Field(default=None, min_length=1, max_length=255)
-    default_price_per_hour: Decimal | None = Field(default=None, gt=0)
+    student_price_per_hour: Decimal | None = Field(default=None, gt=0)
+    public_third_party_price_per_hour: Decimal | None = Field(default=None, gt=0)
+    admin_third_party_price_per_hour: Decimal | None = Field(default=None, gt=0)
     proof_whatsapp: str | None = Field(default=None, max_length=40)
     payment_instructions: str | None = Field(default=None, max_length=2000)
     is_active: bool | None = None
@@ -49,7 +53,9 @@ class CourtRentalPaymentSettingSummaryOut(BaseModel):
     pix_key: str
     merchant_name: str
     merchant_city: str
-    default_price_per_hour: Decimal
+    student_price_per_hour: Decimal
+    public_third_party_price_per_hour: Decimal
+    admin_third_party_price_per_hour: Decimal
     proof_whatsapp: str | None = None
     payment_instructions: str | None = None
     is_active: bool

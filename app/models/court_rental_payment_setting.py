@@ -57,7 +57,12 @@ class CourtRentalPaymentSetting(Base):
         server_default=text("'SAO PAULO'"),
     )
 
-    default_price_per_hour: Mapped[Decimal] = mapped_column(
+    student_price_per_hour: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2),
+        nullable=False,
+    )
+
+    third_party_price_per_hour: Mapped[Decimal] = mapped_column(
         Numeric(10, 2),
         nullable=False,
     )
