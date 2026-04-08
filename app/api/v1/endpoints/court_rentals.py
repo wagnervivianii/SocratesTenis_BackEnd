@@ -65,6 +65,24 @@ router = APIRouter(prefix="/court-rentals", tags=["court-rentals"])
 
 
 COURT_RENTAL_PRICING_PROFILES = {"student", "third_party"}
+COURT_RENTAL_BILLING_MODES = {"single_pix", "monthly_invoice"}
+COURT_RENTAL_PAYMENT_EVIDENCE_STATUSES = {
+    "pending",
+    "customer_uploaded",
+    "admin_uploaded",
+    "not_sent",
+    "not_applicable",
+}
+COURT_RENTAL_OUTCOME_STATUSES = {"pending", "ok", "issue"}
+COURT_RENTAL_OUTCOME_ISSUE_TYPES = {
+    "payment_problem",
+    "no_show",
+    "bad_behavior",
+    "property_damage",
+    "late_arrival_or_early_leave",
+    "other",
+}
+_UNSET = object()
 
 
 def _integrity_to_http(e: IntegrityError) -> HTTPException:
@@ -142,6 +160,68 @@ def _normalize_pricing_profile(value: str | None) -> str:
             detail="Perfil comercial de locação inválido.",
         )
     return cleaned
+
+
+def _normalize_billing_mode(value: str | None) -> str:
+    cleaned = (value or "single_pix").strip().lower()
+    if cleaned not in COURT_RENTAL_BILLING_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Modo de cobrança da locação inválido.",
+        )
+    return cleaned
+
+
+def _normalize_payment_evidence_status(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if cleaned not in COURT_RENTAL_PAYMENT_EVIDENCE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Status do comprovante inválido.",
+        )
+    return cleaned
+
+
+def _normalize_outcome_status(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if cleaned not in COURT_RENTAL_OUTCOME_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Resultado final da locação inválido.",
+        )
+    return cleaned
+
+
+def _normalize_outcome_issue_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if cleaned not in COURT_RENTAL_OUTCOME_ISSUE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tipo de problema da locação inválido.",
+        )
+    return cleaned
+
+
+def _update_rental_business_fields(db: Session, rental_id: UUID, **fields: Any) -> None:
+    updates = []
+    params: dict[str, Any] = {"rental_id": rental_id}
+    for key, value in fields.items():
+        if value is _UNSET:
+            continue
+        updates.append(f"{key} = :{key}")
+        params[key] = value
+    if not updates:
+        return
+    db.execute(
+        text(f"UPDATE public.court_rentals SET {', '.join(updates)} WHERE id = :rental_id"),
+        params,
+    )
 
 
 def _resolve_setting_price_per_hour(
@@ -980,8 +1060,31 @@ def _serialize_rental(rental: CourtRental) -> CourtRentalOut:
         event_id=rental.event_id,
         origin=rental.origin,
         pricing_profile=rental.pricing_profile,
+        billing_mode=getattr(rental, "billing_mode", None),
         status=rental.status,
         payment_status=rental.payment_status,
+        payment_evidence_status=getattr(rental, "payment_evidence_status", None),
+        payment_evidence_notes=getattr(rental, "payment_evidence_notes", None),
+        payment_evidence_recorded_at=getattr(rental, "payment_evidence_recorded_at", None),
+        payment_evidence_recorded_by_user_id=getattr(
+            rental, "payment_evidence_recorded_by_user_id", None
+        ),
+        outcome_status=getattr(rental, "outcome_status", None),
+        outcome_issue_type=getattr(rental, "outcome_issue_type", None),
+        outcome_notes=getattr(rental, "outcome_notes", None),
+        outcome_recorded_at=getattr(rental, "outcome_recorded_at", None),
+        outcome_recorded_by_user_id=getattr(rental, "outcome_recorded_by_user_id", None),
+        deactivated_at=getattr(rental, "deactivated_at", None),
+        deactivated_by_user_id=getattr(rental, "deactivated_by_user_id", None),
+        deactivation_reason=getattr(rental, "deactivation_reason", None),
+        reactivated_at=getattr(rental, "reactivated_at", None),
+        reactivated_by_user_id=getattr(rental, "reactivated_by_user_id", None),
+        reactivation_reason=getattr(rental, "reactivation_reason", None),
+        rescheduled_from_rental_id=getattr(rental, "rescheduled_from_rental_id", None),
+        rescheduled_to_rental_id=getattr(rental, "rescheduled_to_rental_id", None),
+        rescheduled_at=getattr(rental, "rescheduled_at", None),
+        rescheduled_by_user_id=getattr(rental, "rescheduled_by_user_id", None),
+        reschedule_reason=getattr(rental, "reschedule_reason", None),
         customer_name=rental.customer_name,
         customer_email=rental.customer_email,
         customer_whatsapp=rental.customer_whatsapp,
@@ -995,6 +1098,7 @@ def _serialize_rental(rental: CourtRental) -> CourtRentalOut:
         confirmed_at=rental.confirmed_at,
         completed_at=rental.completed_at,
         cancelled_at=rental.cancelled_at,
+        payment_expires_at=rental.payment_expires_at,
         confirmation_email_sent_at=rental.confirmation_email_sent_at,
         payment_proof_submitted_at=rental.payment_proof_submitted_at,
         payment_reviewed_at=rental.payment_reviewed_at,
@@ -1598,6 +1702,10 @@ def _get_admin_rental_row(db: Session, rental_id: UUID):
                   cr.event_id,
                   cr.origin,
                   cr.pricing_profile,
+                  cr.billing_mode,
+                  cr.payment_evidence_status,
+                  cr.outcome_status,
+                  cr.outcome_issue_type,
                   cr.status,
                   cr.payment_status,
                   cr.customer_name,
@@ -2066,6 +2174,9 @@ def schedule_court_rental(
             event_id=event_row["id"],
             origin="public_landing",
             pricing_profile="third_party",
+            billing_mode="single_pix",
+            payment_evidence_status="pending",
+            outcome_status="pending",
             status="awaiting_payment",
             payment_status="pending",
             payment_expires_at=_calculate_public_payment_expires_at(),
@@ -2078,6 +2189,17 @@ def schedule_court_rental(
             notes=_normalize_notes(data.notes),
         )
         db.add(rental)
+        db.flush()
+        _update_rental_business_fields(
+            db,
+            rental.id,
+            billing_mode="single_pix",
+            payment_evidence_status="pending",
+            payment_evidence_notes=None,
+            payment_evidence_recorded_at=None,
+            payment_evidence_recorded_by_user_id=None,
+            outcome_status="pending",
+        )
         db.commit()
         db.refresh(rental)
     except IntegrityError as e:
@@ -2165,13 +2287,24 @@ def _apply_payment_proof_submission(
     rental: CourtRental,
     received_amount: Decimal | None,
     proof_notes: str | None,
+    evidence_status: str,
+    recorded_by_user_id: UUID | None,
 ) -> CourtRental:
+    now = datetime.now(_local_tz())
     rental.payment_status = "proof_sent"
     rental.status = "awaiting_admin_review"
-    rental.payment_proof_submitted_at = datetime.now(_local_tz())
+    rental.payment_proof_submitted_at = now
     rental.payment_received_amount = received_amount
     if proof_notes is not None:
         rental.payment_review_notes = proof_notes
+    _update_rental_business_fields(
+        db,
+        rental.id,
+        payment_evidence_status=evidence_status,
+        payment_evidence_notes=proof_notes,
+        payment_evidence_recorded_at=now,
+        payment_evidence_recorded_by_user_id=recorded_by_user_id,
+    )
     db.flush()
     return rental
 
@@ -2226,6 +2359,8 @@ def submit_court_rental_payment_proof(
         rental=rental,
         received_amount=received_amount,
         proof_notes=proof_notes,
+        evidence_status="customer_uploaded",
+        recorded_by_user_id=current_user.id,
     )
 
     db.commit()
@@ -2369,6 +2504,8 @@ async def upload_court_rental_payment_proof(
         if received_amount is not None
         else rental.payment_received_amount,
         proof_notes=proof_notes,
+        evidence_status="customer_uploaded",
+        recorded_by_user_id=current_user.id,
     )
 
     db.commit()
@@ -2446,6 +2583,13 @@ def cancel_court_rental(
     _cancel_event(db, row["event_id"])
     rental.status = "cancelled"
     rental.cancelled_at = datetime.now(_local_tz())
+    _update_rental_business_fields(
+        db,
+        rental.id,
+        deactivated_at=rental.cancelled_at,
+        deactivated_by_user_id=current_user.id,
+        deactivation_reason="Cancelado pelo locatário.",
+    )
     db.commit()
     db.refresh(rental)
 
@@ -2548,6 +2692,13 @@ def reschedule_court_rental(
             rental.status = "scheduled"
         rental.scheduled_at = data.start_at
         rental.notes = _normalize_notes(data.notes)
+        _update_rental_business_fields(
+            db,
+            rental.id,
+            rescheduled_at=datetime.now(_local_tz()),
+            rescheduled_by_user_id=current_user.id,
+            reschedule_reason=_normalize_notes(getattr(data, "reschedule_reason", None)),
+        )
         db.commit()
         db.refresh(rental)
     except IntegrityError as e:
@@ -2574,11 +2725,209 @@ def reschedule_court_rental(
         old_event_id=old_event_id,
         new_event_id=new_event_row["id"],
         pricing_profile=rental.pricing_profile,
+        billing_mode=getattr(rental, "billing_mode", None),
         status=rental.status,
         payment_status=rental.payment_status,
         start_at=new_event_row["start_at"],
         end_at=new_event_row["end_at"],
         court_id=new_event_row["court_id"],
+        rescheduled_at=datetime.now(_local_tz()),
+        message=message,
+        email_sent=email_sent,
+    )
+
+
+def _duplicate_payment_proofs_for_rescheduled_rental(
+    db: Session,
+    *,
+    source_rental_id: UUID,
+    target_rental_id: UUID,
+) -> None:
+    proofs = (
+        db.query(CourtRentalPaymentProof)
+        .filter(CourtRentalPaymentProof.court_rental_id == source_rental_id)
+        .order_by(CourtRentalPaymentProof.created_at.asc())
+        .all()
+    )
+
+    for proof in proofs:
+        db.add(
+            CourtRentalPaymentProof(
+                court_rental_id=target_rental_id,
+                uploaded_by_user_id=proof.uploaded_by_user_id,
+                original_file_name=proof.original_file_name,
+                stored_file_name=proof.stored_file_name,
+                storage_path=proof.storage_path,
+                mime_type=proof.mime_type,
+                file_size_bytes=proof.file_size_bytes,
+                notes=proof.notes,
+            )
+        )
+
+
+@router.post("/admin/bookings/{rental_id}/reschedule", response_model=CourtRentalRescheduleOut)
+def admin_reschedule_court_rental(
+    rental_id: UUID,
+    data: CourtRentalRescheduleIn,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    admin_user = _require_admin(db, user_id)
+    _expire_overdue_public_pending_rentals(db)
+
+    rental = db.get(CourtRental, rental_id)
+    if not rental:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+
+    if rental.status in {"cancelled", "completed", "rejected"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Não é possível reagendar uma locação que já está encerrada, cancelada ou rejeitada.",
+        )
+
+    event_info = _get_rental_event_snapshot_or_404(db, rental.event_id)
+    _can_cancel, can_reschedule, _deadline_at, _rule_message, status_message = _get_change_policy(
+        event_info["start_at"]
+    )
+    if not can_reschedule:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "COURT_RENTAL_RESCHEDULE_WINDOW_EXPIRED", "message": status_message},
+        )
+
+    if data.end_at <= data.start_at:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "INVALID_TIME_RANGE",
+                "message": "end_at precisa ser maior que start_at.",
+            },
+        )
+
+    _validate_court_rental_slot_duration(data.start_at, data.end_at)
+    _validate_court_rental_date_window(data.start_at.astimezone(_local_tz()).date())
+    _validate_court_rental_not_in_past(data.start_at)
+    _ensure_slot_available_or_409(
+        db, court_id=data.court_id, start_at=data.start_at, end_at=data.end_at
+    )
+
+    rescheduled_at = datetime.now(_local_tz())
+    normalized_reason = _normalize_notes(getattr(data, "reschedule_reason", None))
+    new_notes = _normalize_notes(data.notes)
+    old_event_id = event_info["id"]
+    deactivation_reason = normalized_reason or "Locação reagendada pelo painel administrativo."
+
+    try:
+        _cancel_event(db, old_event_id)
+        new_event_row = _create_event(
+            db,
+            court_id=data.court_id,
+            student_id=rental.customer_student_id,
+            created_by=UUID(str(admin_user["id"])),
+            start_at=data.start_at,
+            end_at=data.end_at,
+            notes=new_notes or rental.notes or "Locação de quadra reagendada pelo painel.",
+        )
+
+        new_rental = CourtRental(
+            user_id=rental.user_id,
+            created_by_user_id=rental.created_by_user_id,
+            customer_user_id=rental.customer_user_id,
+            customer_student_id=rental.customer_student_id,
+            payment_reviewed_by_user_id=rental.payment_reviewed_by_user_id,
+            payment_evidence_recorded_by_user_id=rental.payment_evidence_recorded_by_user_id,
+            outcome_recorded_by_user_id=rental.outcome_recorded_by_user_id,
+            event_id=new_event_row["id"],
+            origin=rental.origin,
+            pricing_profile=rental.pricing_profile,
+            billing_mode=rental.billing_mode,
+            status=rental.status,
+            payment_status=rental.payment_status,
+            payment_evidence_status=rental.payment_evidence_status,
+            payment_evidence_notes=rental.payment_evidence_notes,
+            payment_evidence_recorded_at=rental.payment_evidence_recorded_at,
+            outcome_status=rental.outcome_status,
+            outcome_issue_type=rental.outcome_issue_type,
+            outcome_notes=rental.outcome_notes,
+            outcome_recorded_at=rental.outcome_recorded_at,
+            rescheduled_from_rental_id=rental.id,
+            rescheduled_at=rescheduled_at,
+            rescheduled_by_user_id=UUID(str(admin_user["id"])),
+            reschedule_reason=normalized_reason,
+            customer_name=rental.customer_name,
+            customer_email=rental.customer_email,
+            customer_whatsapp=rental.customer_whatsapp,
+            price_per_hour=rental.price_per_hour,
+            total_amount=rental.total_amount,
+            payment_received_amount=rental.payment_received_amount,
+            pix_key=rental.pix_key,
+            pix_qr_code_payload=rental.pix_qr_code_payload,
+            requested_at=rental.requested_at,
+            scheduled_at=data.start_at,
+            confirmed_at=rental.confirmed_at,
+            payment_expires_at=rental.payment_expires_at,
+            payment_proof_submitted_at=rental.payment_proof_submitted_at,
+            payment_reviewed_at=rental.payment_reviewed_at,
+            payment_amount_matches_expected=rental.payment_amount_matches_expected,
+            payment_review_notes=rental.payment_review_notes,
+            notes=new_notes or rental.notes,
+        )
+        db.add(new_rental)
+        db.flush()
+
+        _duplicate_payment_proofs_for_rescheduled_rental(
+            db,
+            source_rental_id=rental.id,
+            target_rental_id=new_rental.id,
+        )
+
+        rental.status = "cancelled"
+        rental.cancelled_at = rescheduled_at
+        rental.deactivated_at = rescheduled_at
+        rental.deactivated_by_user_id = UUID(str(admin_user["id"]))
+        rental.deactivation_reason = deactivation_reason
+        rental.rescheduled_to_rental_id = new_rental.id
+        rental.rescheduled_at = rescheduled_at
+        rental.rescheduled_by_user_id = UUID(str(admin_user["id"]))
+        rental.reschedule_reason = normalized_reason
+
+        db.commit()
+        db.refresh(new_rental)
+        db.refresh(rental)
+    except IntegrityError as e:
+        db.rollback()
+        raise _integrity_to_http(e) from e
+
+    court_name = _get_court_name(db, data.court_id)
+    email_sent = _send_court_rental_email(
+        to_email=new_rental.customer_email,
+        recipient_name=new_rental.customer_name,
+        action="rescheduled",
+        start_at=new_event_row["start_at"],
+        end_at=new_event_row["end_at"],
+        court_name=court_name,
+    )
+    _mark_confirmation_email_if_sent(db, new_rental, email_sent)
+
+    message = (
+        "Locação reagendada com sucesso pelo painel. "
+        "O horário anterior foi liberado e o vínculo entre a locação original e a nova ocorrência foi registrado."
+    )
+    if email_sent:
+        message = f"{message} Também enviamos um e-mail de confirmação para o cliente."
+
+    return CourtRentalRescheduleOut(
+        rental_id=new_rental.id,
+        old_event_id=old_event_id,
+        new_event_id=new_event_row["id"],
+        pricing_profile=new_rental.pricing_profile,
+        billing_mode=getattr(new_rental, "billing_mode", None),
+        status=new_rental.status,
+        payment_status=new_rental.payment_status,
+        start_at=new_event_row["start_at"],
+        end_at=new_event_row["end_at"],
+        court_id=new_event_row["court_id"],
+        rescheduled_at=rescheduled_at,
         message=message,
         email_sent=email_sent,
     )
@@ -2736,6 +3085,114 @@ def admin_download_court_rental_payment_proof(
 
 
 @router.post(
+    "/admin/bookings/{rental_id}/payment-proof-upload",
+    response_model=CourtRentalPaymentProofUploadOut,
+)
+async def admin_upload_court_rental_payment_proof(
+    rental_id: UUID,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    db: Annotated[Session, Depends(get_db)],
+    proof_file: Annotated[UploadFile, File(...)],
+    payment_received_amount: Annotated[str | None, Form()] = None,
+    notes: Annotated[str | None, Form()] = None,
+):
+    admin_user = _require_admin(db, user_id)
+    rental = db.get(CourtRental, rental_id)
+    if not rental:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+
+    content_type = (proof_file.content_type or "").lower()
+    allowed_content_types = {
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/webp",
+    }
+    if content_type not in allowed_content_types:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Envie o comprovante em PDF, PNG, JPG ou WEBP.",
+        )
+
+    file_bytes = await proof_file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="O arquivo do comprovante está vazio.",
+        )
+
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="O comprovante deve ter no máximo 10 MB.",
+        )
+
+    received_amount = None
+    if payment_received_amount is not None and str(payment_received_amount).strip():
+        try:
+            received_amount = _quantize_money(
+                Decimal(str(payment_received_amount).strip().replace(",", "."))
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Informe um valor de pagamento válido.",
+            ) from exc
+
+    proof_notes = _normalize_notes(notes)
+    storage_dir = _payment_proof_storage_dir() / str(rental.id)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    extension = _guess_extension(proof_file)
+    stored_file_name = (
+        f"{datetime.now(_local_tz()):%Y%m%d%H%M%S}_{UUID(str(admin_user['id'])).hex}{extension}"
+    )
+    absolute_path = storage_dir / stored_file_name
+    absolute_path.write_bytes(file_bytes)
+
+    proof = CourtRentalPaymentProof(
+        court_rental_id=rental.id,
+        uploaded_by_user_id=UUID(str(admin_user["id"])),
+        original_file_name=proof_file.filename or stored_file_name,
+        stored_file_name=stored_file_name,
+        storage_path=str(absolute_path.relative_to(Path(__file__).resolve().parents[4])),
+        mime_type=content_type,
+        file_size_bytes=len(file_bytes),
+        notes=proof_notes,
+    )
+    db.add(proof)
+
+    _apply_payment_proof_submission(
+        db=db,
+        rental=rental,
+        received_amount=received_amount
+        if received_amount is not None
+        else rental.payment_received_amount,
+        proof_notes=proof_notes,
+        evidence_status="admin_uploaded",
+        recorded_by_user_id=UUID(str(admin_user["id"])),
+    )
+
+    db.commit()
+    db.refresh(rental)
+    db.refresh(proof)
+
+    return CourtRentalPaymentProofUploadOut(
+        rental_id=rental.id,
+        pricing_profile=rental.pricing_profile,
+        status=rental.status,
+        payment_status=rental.payment_status,
+        payment_proof_submitted_at=rental.payment_proof_submitted_at,
+        payment_received_amount=str(rental.payment_received_amount)
+        if rental.payment_received_amount is not None
+        else None,
+        proof=_serialize_payment_proof(proof),
+        message="Comprovante anexado pelo painel administrativo com sucesso.",
+        email_sent=False,
+    )
+
+
+@router.post(
     "/admin/bookings/{rental_id}/payment-definition",
     response_model=CourtRentalAdminPaymentDefinitionOut,
 )
@@ -2872,46 +3329,66 @@ def admin_create_court_rental(
             detail="Para usar a tarifa de aluno, selecione um aluno vinculado.",
         )
 
-    court_name = _get_court_name(db, data.court_id)
-    (
-        resolved_price_per_hour,
-        resolved_total_amount,
-        resolved_pix_key,
-        resolved_pix_qr_code_payload,
-    ) = _resolve_admin_create_payment_context(
-        db=db,
-        pricing_profile=pricing_profile,
-        origin=data.origin,
-        court_name=court_name,
-        start_at=data.start_at,
-        end_at=data.end_at,
-        explicit_price_per_hour=data.price_per_hour,
-        explicit_total_amount=data.total_amount,
-        explicit_pix_key=data.pix_key,
-        explicit_pix_qr_code_payload=data.pix_qr_code_payload,
-    )
+    billing_mode = _normalize_billing_mode(getattr(data, "billing_mode", None)) or "single_pix"
+    if billing_mode == "monthly_invoice" and pricing_profile != "student":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cobrança junto à mensalidade só pode ser usada para aluno.",
+        )
 
-    payment_context_present = all(
-        value is not None
-        for value in [
+    court_name = _get_court_name(db, data.court_id)
+    resolved_price_per_hour = None
+    resolved_total_amount = None
+    resolved_pix_key = None
+    resolved_pix_qr_code_payload = None
+    if billing_mode == "single_pix":
+        (
             resolved_price_per_hour,
             resolved_total_amount,
             resolved_pix_key,
             resolved_pix_qr_code_payload,
-        ]
-    )
-    if not payment_context_present:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "ADMIN_RENTAL_PIX_SETTING_REQUIRED",
-                "message": "Defina o valor da locação com uma configuração Pix ativa para gerar a cobrança completa antes de salvar.",
-            },
+        ) = _resolve_admin_create_payment_context(
+            db=db,
+            pricing_profile=pricing_profile,
+            origin=data.origin,
+            court_name=court_name,
+            start_at=data.start_at,
+            end_at=data.end_at,
+            explicit_price_per_hour=data.price_per_hour,
+            explicit_total_amount=data.total_amount,
+            explicit_pix_key=data.pix_key,
+            explicit_pix_qr_code_payload=data.pix_qr_code_payload,
         )
 
-    status_value = "awaiting_payment"
-    payment_status_value = "pending"
-    confirmed_at_value = None
+        payment_context_present = all(
+            value is not None
+            for value in [
+                resolved_price_per_hour,
+                resolved_total_amount,
+                resolved_pix_key,
+                resolved_pix_qr_code_payload,
+            ]
+        )
+        if not payment_context_present:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "ADMIN_RENTAL_PIX_SETTING_REQUIRED",
+                    "message": "Defina o valor da locação com uma configuração Pix ativa para gerar a cobrança completa antes de salvar.",
+                },
+            )
+        status_value = "awaiting_payment"
+        payment_status_value = "pending"
+        confirmed_at_value = None
+        payment_evidence_status_value = (
+            _normalize_payment_evidence_status(getattr(data, "payment_evidence_status", None))
+            or "pending"
+        )
+    else:
+        status_value = "scheduled"
+        payment_status_value = "not_required"
+        confirmed_at_value = datetime.now(_local_tz())
+        payment_evidence_status_value = "not_applicable"
 
     try:
         event_row = _create_event(
@@ -2931,6 +3408,9 @@ def admin_create_court_rental(
             event_id=event_row["id"],
             origin=data.origin,
             pricing_profile=pricing_profile,
+            billing_mode=billing_mode,
+            payment_evidence_status=payment_evidence_status_value,
+            outcome_status="pending",
             status=status_value,
             payment_status=payment_status_value,
             customer_name=customer["customer_name"],
@@ -2945,6 +3425,21 @@ def admin_create_court_rental(
             notes=_normalize_notes(data.notes),
         )
         db.add(rental)
+        db.flush()
+        _update_rental_business_fields(
+            db,
+            rental.id,
+            billing_mode=billing_mode,
+            payment_evidence_status=payment_evidence_status_value,
+            payment_evidence_notes=_normalize_notes(getattr(data, "payment_evidence_notes", None)),
+            payment_evidence_recorded_at=datetime.now(_local_tz())
+            if payment_evidence_status_value in {"not_applicable", "not_sent"}
+            else None,
+            payment_evidence_recorded_by_user_id=UUID(str(admin_user["id"]))
+            if payment_evidence_status_value in {"not_applicable", "not_sent"}
+            else None,
+            outcome_status="pending",
+        )
         db.commit()
         db.refresh(rental)
     except IntegrityError as e:
@@ -2978,7 +3473,7 @@ def admin_update_court_rental(
     db: Annotated[Session, Depends(get_db)],
     user_id: Annotated[str, Depends(get_current_user_id)],
 ):
-    _require_admin(db, user_id)
+    admin_user = _require_admin(db, user_id)
     rental = db.get(CourtRental, rental_id)
     if not rental:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
@@ -3020,6 +3515,36 @@ def admin_update_court_rental(
             )
         rental.pricing_profile = normalized_pricing_profile
 
+    business_updates: dict[str, Any] = {}
+    if "billing_mode" in payload and payload["billing_mode"] is not None:
+        billing_mode = _normalize_billing_mode(payload["billing_mode"])
+        if billing_mode == "monthly_invoice" and rental.pricing_profile != "student":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Cobrança junto à mensalidade só pode ser usada para aluno.",
+            )
+        business_updates["billing_mode"] = billing_mode
+    if "payment_evidence_status" in payload:
+        business_updates["payment_evidence_status"] = _normalize_payment_evidence_status(
+            payload["payment_evidence_status"]
+        )
+        business_updates["payment_evidence_recorded_at"] = datetime.now(_local_tz())
+        business_updates["payment_evidence_recorded_by_user_id"] = UUID(str(admin_user["id"]))
+    if "payment_evidence_notes" in payload:
+        business_updates["payment_evidence_notes"] = _normalize_notes(
+            payload["payment_evidence_notes"]
+        )
+    if any(key in payload for key in ["outcome_status", "outcome_issue_type", "outcome_notes"]):
+        outcome_status = _normalize_outcome_status(payload.get("outcome_status"))
+        outcome_issue_type = _normalize_outcome_issue_type(payload.get("outcome_issue_type"))
+        business_updates["outcome_status"] = outcome_status
+        business_updates["outcome_issue_type"] = (
+            outcome_issue_type if outcome_status == "issue" else None
+        )
+        business_updates["outcome_notes"] = _normalize_notes(payload.get("outcome_notes"))
+        business_updates["outcome_recorded_at"] = datetime.now(_local_tz())
+        business_updates["outcome_recorded_by_user_id"] = UUID(str(admin_user["id"]))
+
     if "price_per_hour" in payload:
         rental.price_per_hour = payload["price_per_hour"]
     if "total_amount" in payload:
@@ -3041,13 +3566,43 @@ def admin_update_court_rental(
 
     if "status" in payload and payload["status"] is not None:
         new_status = payload["status"]
+        current_status = rental.status
         if new_status in {"cancelled", "rejected"}:
             _cancel_event(db, rental.event_id)
             rental.cancelled_at = datetime.now(_local_tz())
+            business_updates["deactivated_at"] = rental.cancelled_at
+            business_updates["deactivated_by_user_id"] = UUID(str(admin_user["id"]))
+            business_updates["deactivation_reason"] = _normalize_notes(
+                payload.get("deactivation_reason")
+            )
+        elif current_status == "cancelled" and new_status in {
+            "scheduled",
+            "awaiting_payment",
+            "confirmed",
+        }:
+            event_info = _get_rental_event_snapshot_or_404(db, rental.event_id)
+            if not _court_slot_is_still_available(
+                db, event_info["start_at"], event_info["end_at"], event_info["court_id"]
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="O horário original não está mais disponível para reativação.",
+                )
+            db.execute(
+                text("UPDATE public.events SET status = 'confirmado' WHERE id = :event_id"),
+                {"event_id": rental.event_id},
+            )
+            business_updates["reactivated_at"] = datetime.now(_local_tz())
+            business_updates["reactivated_by_user_id"] = UUID(str(admin_user["id"]))
+            business_updates["reactivation_reason"] = _normalize_notes(
+                payload.get("reactivation_reason")
+            )
+            rental.cancelled_at = None
         if new_status in {"confirmed", "scheduled"} and rental.confirmed_at is None:
             rental.confirmed_at = datetime.now(_local_tz())
         rental.status = new_status
 
+    _update_rental_business_fields(db, rental.id, **business_updates)
     db.commit()
     db.refresh(rental)
 
@@ -3113,6 +3668,11 @@ def admin_review_court_rental_payment(
     elif received_amount is not None and rental.total_amount is not None:
         rental.payment_amount_matches_expected = received_amount == rental.total_amount
 
+    business_updates: dict[str, Any] = {
+        "payment_evidence_status": "customer_uploaded"
+        if rental.payment_proof_submitted_at is not None
+        else _UNSET,
+    }
     if data.payment_status == "approved":
         rental.status = "confirmed"
         if rental.confirmed_at is None:
@@ -3123,9 +3683,18 @@ def admin_review_court_rental_payment(
         rental.status = "rejected"
         rental.cancelled_at = datetime.now(_local_tz())
         _cancel_event(db, rental.event_id)
+        business_updates["outcome_status"] = "issue"
+        business_updates["outcome_issue_type"] = "payment_problem"
+        business_updates["outcome_notes"] = rental.payment_review_notes
+        business_updates["outcome_recorded_at"] = datetime.now(_local_tz())
+        business_updates["outcome_recorded_by_user_id"] = UUID(str(admin_user["id"]))
+        business_updates["deactivated_at"] = rental.cancelled_at
+        business_updates["deactivated_by_user_id"] = UUID(str(admin_user["id"]))
+        business_updates["deactivation_reason"] = "Pagamento rejeitado."
         message = "Pagamento rejeitado e locação encerrada."
         email_action = "payment_rejected"
 
+    _update_rental_business_fields(db, rental.id, **business_updates)
     db.commit()
     db.refresh(rental)
 

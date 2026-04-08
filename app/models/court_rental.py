@@ -76,6 +76,13 @@ class CourtRental(Base):
         index=True,
     )
 
+    billing_mode: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'single_pix'"),
+        index=True,
+    )
+
     status: Mapped[str] = mapped_column(
         Text,
         nullable=False,
@@ -88,6 +95,125 @@ class CourtRental(Base):
         nullable=False,
         server_default=text("'not_required'"),
         index=True,
+    )
+
+    payment_evidence_status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'pending'"),
+        index=True,
+    )
+
+    payment_evidence_notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    payment_evidence_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    payment_evidence_recorded_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    outcome_status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'pending'"),
+        index=True,
+    )
+
+    outcome_issue_type: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        index=True,
+    )
+
+    outcome_notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    outcome_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    outcome_recorded_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    deactivated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    deactivated_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    deactivation_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    reactivated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    reactivated_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    reactivation_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    rescheduled_from_rental_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("court_rentals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    rescheduled_to_rental_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("court_rentals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    rescheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    rescheduled_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    reschedule_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
     )
 
     customer_name: Mapped[str | None] = mapped_column(

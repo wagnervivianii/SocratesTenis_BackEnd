@@ -19,6 +19,11 @@ CourtRentalPricingProfile = Literal[
     "third_party",
 ]
 
+CourtRentalBillingMode = Literal[
+    "single_pix",
+    "monthly_invoice",
+]
+
 CourtRentalStatus = Literal[
     "requested",
     "awaiting_payment",
@@ -39,6 +44,29 @@ CourtRentalPaymentStatus = Literal[
     "approved",
     "rejected",
     "expired",
+]
+
+CourtRentalPaymentEvidenceStatus = Literal[
+    "pending",
+    "customer_uploaded",
+    "admin_uploaded",
+    "not_sent",
+    "not_applicable",
+]
+
+CourtRentalOutcomeStatus = Literal[
+    "pending",
+    "ok",
+    "issue",
+]
+
+CourtRentalOutcomeIssueType = Literal[
+    "payment_problem",
+    "no_show",
+    "bad_behavior",
+    "property_damage",
+    "late_arrival_or_early_leave",
+    "other",
 ]
 
 
@@ -91,6 +119,7 @@ class CourtRentalAdminCreateIn(BaseModel):
     end_at: datetime
     origin: CourtRentalOrigin = "admin_panel"
     pricing_profile: CourtRentalPricingProfile = "third_party"
+    billing_mode: CourtRentalBillingMode = "single_pix"
     customer_user_id: UUID | None = None
     customer_student_id: UUID | None = None
     customer_name: str | None = Field(default=None, min_length=3, max_length=150)
@@ -100,11 +129,14 @@ class CourtRentalAdminCreateIn(BaseModel):
     total_amount: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     pix_key: str | None = Field(default=None, max_length=500)
     pix_qr_code_payload: str | None = Field(default=None, max_length=5000)
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
+    payment_evidence_notes: str | None = Field(default=None, max_length=1000)
     notes: str | None = Field(default=None, max_length=1000)
 
 
 class CourtRentalAdminUpdateIn(BaseModel):
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     customer_user_id: UUID | None = None
     customer_student_id: UUID | None = None
     customer_name: str | None = Field(default=None, min_length=3, max_length=150)
@@ -116,6 +148,14 @@ class CourtRentalAdminUpdateIn(BaseModel):
     pix_qr_code_payload: str | None = Field(default=None, max_length=5000)
     status: CourtRentalStatus | None = None
     payment_status: CourtRentalPaymentStatus | None = None
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
+    payment_evidence_notes: str | None = Field(default=None, max_length=1000)
+    outcome_status: CourtRentalOutcomeStatus | None = None
+    outcome_issue_type: CourtRentalOutcomeIssueType | None = None
+    outcome_notes: str | None = Field(default=None, max_length=1000)
+    deactivation_reason: str | None = Field(default=None, max_length=1000)
+    reactivation_reason: str | None = Field(default=None, max_length=1000)
+    reschedule_reason: str | None = Field(default=None, max_length=1000)
     notes: str | None = Field(default=None, max_length=1000)
 
 
@@ -130,8 +170,10 @@ class CourtRentalAdminPaymentDefinitionIn(BaseModel):
 class CourtRentalAdminPaymentDefinitionOut(BaseModel):
     rental_id: UUID
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     status: str
     payment_status: str
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
     price_per_hour: Decimal | None = None
     total_amount: Decimal | None = None
     pix_key: str | None = None
@@ -153,8 +195,10 @@ class CourtRentalProofSubmissionIn(BaseModel):
 class CourtRentalProofSubmissionOut(BaseModel):
     rental_id: UUID
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     status: str
     payment_status: str
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
     payment_proof_submitted_at: datetime | None = None
     payment_received_amount: Decimal | None = None
     message: str
@@ -176,8 +220,10 @@ class CourtRentalPaymentReviewIn(BaseModel):
 class CourtRentalPaymentReviewOut(BaseModel):
     rental_id: UUID
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     status: str
     payment_status: str
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
     payment_reviewed_at: datetime | None = None
     payment_amount_matches_expected: bool | None = None
     payment_received_amount: Decimal | None = None
@@ -193,6 +239,7 @@ class CourtRentalScheduleOut(BaseModel):
     payment_status: str | None = None
     origin: str | None = None
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     start_at: datetime
     end_at: datetime
     court_id: UUID
@@ -207,6 +254,10 @@ class CourtRentalUpcomingItemOut(BaseModel):
     payment_status: str | None = None
     origin: str | None = None
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
+    outcome_status: CourtRentalOutcomeStatus | None = None
+    outcome_issue_type: CourtRentalOutcomeIssueType | None = None
     start_at: datetime
     end_at: datetime
     court_id: UUID
@@ -234,6 +285,12 @@ class CourtRentalHistoryItemOut(BaseModel):
     payment_status: str | None = None
     origin: str | None = None
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
+    payment_evidence_notes: str | None = None
+    outcome_status: CourtRentalOutcomeStatus | None = None
+    outcome_issue_type: CourtRentalOutcomeIssueType | None = None
+    outcome_notes: str | None = None
     start_at: datetime | None = None
     end_at: datetime | None = None
     court_id: UUID | None = None
@@ -248,6 +305,11 @@ class CourtRentalHistoryItemOut(BaseModel):
     confirmed_at: datetime | None = None
     completed_at: datetime | None = None
     cancelled_at: datetime | None = None
+    deactivated_at: datetime | None = None
+    reactivated_at: datetime | None = None
+    rescheduled_at: datetime | None = None
+    rescheduled_from_rental_id: UUID | None = None
+    rescheduled_to_rental_id: UUID | None = None
     requested_at: datetime | None = None
     notes: str | None = None
     can_cancel: bool = False
@@ -267,8 +329,11 @@ class CourtRentalCancelOut(BaseModel):
     rental_id: UUID
     event_id: UUID
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     status: str
     payment_status: str | None = None
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
+    deactivated_at: datetime | None = None
     message: str
     email_sent: bool = False
 
@@ -278,6 +343,7 @@ class CourtRentalRescheduleIn(BaseModel):
     start_at: datetime
     end_at: datetime
     notes: str | None = Field(default=None, max_length=1000)
+    reschedule_reason: str | None = Field(default=None, max_length=1000)
 
 
 class CourtRentalRescheduleOut(BaseModel):
@@ -285,11 +351,13 @@ class CourtRentalRescheduleOut(BaseModel):
     old_event_id: UUID
     new_event_id: UUID
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     status: str
     payment_status: str | None = None
     start_at: datetime
     end_at: datetime
     court_id: UUID
+    rescheduled_at: datetime | None = None
     message: str
     email_sent: bool = False
 
@@ -297,7 +365,9 @@ class CourtRentalRescheduleOut(BaseModel):
 class CourtRentalPaymentInstructionOut(BaseModel):
     rental_id: UUID
     pricing_profile: CourtRentalPricingProfile | None = None
+    billing_mode: CourtRentalBillingMode | None = None
     payment_status: str
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
     total_amount: Decimal | None = None
     pix_key: str | None = None
     pix_qr_code_payload: str | None = None
@@ -312,11 +382,26 @@ class CourtRentalOut(BaseModel):
     customer_user_id: UUID | None = None
     customer_student_id: UUID | None = None
     payment_reviewed_by_user_id: UUID | None = None
+    payment_evidence_recorded_by_user_id: UUID | None = None
+    outcome_recorded_by_user_id: UUID | None = None
+    deactivated_by_user_id: UUID | None = None
+    reactivated_by_user_id: UUID | None = None
+    rescheduled_by_user_id: UUID | None = None
     event_id: UUID | None = None
+    rescheduled_from_rental_id: UUID | None = None
+    rescheduled_to_rental_id: UUID | None = None
     origin: str
     pricing_profile: CourtRentalPricingProfile
+    billing_mode: CourtRentalBillingMode = "single_pix"
     status: str
     payment_status: str
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
+    payment_evidence_notes: str | None = None
+    payment_evidence_recorded_at: datetime | None = None
+    outcome_status: CourtRentalOutcomeStatus | None = None
+    outcome_issue_type: CourtRentalOutcomeIssueType | None = None
+    outcome_notes: str | None = None
+    outcome_recorded_at: datetime | None = None
     customer_name: str | None = None
     customer_email: str | None = None
     customer_whatsapp: str | None = None
@@ -330,6 +415,12 @@ class CourtRentalOut(BaseModel):
     confirmed_at: datetime | None = None
     completed_at: datetime | None = None
     cancelled_at: datetime | None = None
+    deactivated_at: datetime | None = None
+    deactivation_reason: str | None = None
+    reactivated_at: datetime | None = None
+    reactivation_reason: str | None = None
+    rescheduled_at: datetime | None = None
+    reschedule_reason: str | None = None
     payment_expires_at: datetime | None = None
     confirmation_email_sent_at: datetime | None = None
     payment_proof_submitted_at: datetime | None = None
@@ -345,8 +436,12 @@ class CourtRentalAdminListItemOut(BaseModel):
     id: UUID
     origin: str
     pricing_profile: CourtRentalPricingProfile
+    billing_mode: CourtRentalBillingMode = "single_pix"
     status: str
     payment_status: str
+    payment_evidence_status: CourtRentalPaymentEvidenceStatus | None = None
+    outcome_status: CourtRentalOutcomeStatus | None = None
+    outcome_issue_type: CourtRentalOutcomeIssueType | None = None
     court_id: UUID | None = None
     court_name: str | None = None
     start_at: datetime | None = None
@@ -359,6 +454,7 @@ class CourtRentalAdminListItemOut(BaseModel):
     payment_proof_submitted_at: datetime | None = None
     payment_reviewed_at: datetime | None = None
     confirmed_at: datetime | None = None
+    deactivated_at: datetime | None = None
     created_at: datetime
 
 
