@@ -153,6 +153,40 @@ def _normalize_instagram_handle(value: str | None) -> str | None:
     return normalized.removeprefix("@").strip().lower() or None
 
 
+def _find_teacher_by_email(db: Session, *, email: str):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT id, full_name, email, user_id, is_active
+                FROM public.teachers
+                WHERE lower(email) = :email
+                LIMIT 1
+                """
+            ),
+            {"email": email.lower()},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _ensure_email_not_used_by_teacher(db: Session, *, email: str | None) -> None:
+    normalized_email = _normalize_optional_email(email)
+    if not normalized_email:
+        return
+
+    conflict = _find_teacher_by_email(db, email=normalized_email)
+    if conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Este e-mail já está cadastrado para um professor. "
+                "Cada e-mail pode pertencer a apenas um grupo no sistema."
+            ),
+        )
+
+
 def _get_student_or_404(db: Session, student_id: UUID):
     row = (
         db.execute(
@@ -397,6 +431,7 @@ def _build_student_import_preview(
 
     duplicate_email_counter = Counter(emails_in_file)
     existing_emails = set()
+    teacher_emails = set()
     unique_emails = sorted({email for email in emails_in_file if email})
     if unique_emails:
         existing_email_rows = (
@@ -414,6 +449,22 @@ def _build_student_import_preview(
             .all()
         )
         existing_emails = {str(email).lower() for email in existing_email_rows if email}
+
+        teacher_email_rows = (
+            db.execute(
+                text(
+                    """
+                    SELECT email
+                    FROM public.teachers
+                    WHERE email = ANY(:emails)
+                    """
+                ),
+                {"emails": unique_emails},
+            )
+            .scalars()
+            .all()
+        )
+        teacher_emails = {str(email).lower() for email in teacher_email_rows if email}
 
     preview_rows: list[StudentImportRowPreviewOut] = []
 
@@ -467,6 +518,10 @@ def _build_student_import_preview(
                 errors.append("E-mail duplicado dentro do arquivo.")
             if email.lower() in existing_emails:
                 errors.append("Já existe aluno cadastrado com este e-mail.")
+            if email.lower() in teacher_emails:
+                errors.append(
+                    "Este e-mail já está cadastrado para um professor. Cada e-mail pode pertencer a apenas um grupo no sistema."
+                )
 
         preview_rows.append(
             StudentImportRowPreviewOut(
@@ -761,6 +816,9 @@ def create_student(
 ):
     _require_admin(db, user_id)
 
+    email = _normalize_optional_email(str(payload.email) if payload.email else None)
+    _ensure_email_not_used_by_teacher(db, email=email)
+
     try:
         row = (
             db.execute(
@@ -806,9 +864,7 @@ def create_student(
                 ),
                 {
                     "full_name": payload.full_name.strip(),
-                    "email": _normalize_optional_email(
-                        str(payload.email) if payload.email else None
-                    ),
+                    "email": email,
                     "phone": _normalize_optional_text(payload.phone),
                     "notes": _normalize_optional_text(payload.notes),
                     "profession": _normalize_optional_text(payload.profession),
@@ -889,6 +945,8 @@ def update_student(
         ),
         "is_active": (payload.is_active if payload.is_active is not None else current["is_active"]),
     }
+
+    _ensure_email_not_used_by_teacher(db, email=merged["email"])
 
     try:
         row = (
