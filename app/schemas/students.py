@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
+
+StudentMakeupRequestStatus = Literal["pending", "scheduled", "rejected", "cancelled"]
+StudentMakeupRequestSource = Literal["student_portal", "admin_manual"]
 
 
 class StudentCreateIn(BaseModel):
@@ -141,3 +145,74 @@ class StudentHomeOut(BaseModel):
     class_groups: list[StudentHomeClassGroupOut] = Field(default_factory=list)
     upcoming_rentals: list[StudentHomeRentalOut] = Field(default_factory=list)
     recent_rental_history: list[StudentHomeRentalOut] = Field(default_factory=list)
+
+
+class StudentMakeupRequestCreateIn(BaseModel):
+    class_group_enrollment_id: UUID
+    original_event_id: UUID | None = None
+    student_note: str | None = Field(default=None, max_length=1000)
+
+
+class StudentMakeupRequestAdminCreateIn(BaseModel):
+    student_id: UUID
+    class_group_enrollment_id: UUID
+    original_event_id: UUID | None = None
+    original_lesson_date: date | None = None
+    original_start_at: datetime | None = None
+    original_end_at: datetime | None = None
+    student_note: str | None = Field(default=None, max_length=1000)
+    admin_note: str | None = Field(default=None, max_length=1000)
+
+
+class StudentMakeupRequestScheduleIn(BaseModel):
+    replacement_event_id: UUID | None = None
+    replacement_class_group_id: UUID | None = None
+    admin_note: str | None = Field(default=None, max_length=1000)
+
+
+class StudentMakeupRequestReviewIn(BaseModel):
+    status: Literal["scheduled", "rejected", "cancelled"]
+    admin_note: str | None = Field(default=None, max_length=1000)
+    replacement_event_id: UUID | None = None
+    replacement_class_group_id: UUID | None = None
+
+
+class StudentMakeupRequestOut(BaseModel):
+    id: UUID
+    student_id: UUID
+    class_group_enrollment_id: UUID
+    requested_by_user_id: UUID | None = None
+    processed_by_user_id: UUID | None = None
+    source: StudentMakeupRequestSource
+    status: StudentMakeupRequestStatus
+
+    original_event_id: UUID | None = None
+    original_class_group_id: UUID | None = None
+    original_teacher_id: UUID | None = None
+    original_court_id: UUID | None = None
+    original_lesson_date: date | None = None
+    original_start_at: datetime | None = None
+    original_end_at: datetime | None = None
+
+    replacement_event_id: UUID | None = None
+    replacement_class_group_id: UUID | None = None
+    replacement_teacher_id: UUID | None = None
+    replacement_court_id: UUID | None = None
+    replacement_lesson_date: date | None = None
+    replacement_start_at: datetime | None = None
+    replacement_end_at: datetime | None = None
+
+    student_note: str | None = None
+    admin_note: str | None = None
+    requested_at: datetime
+    processed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class StudentMakeupRequestListItemOut(StudentMakeupRequestOut):
+    student_name: str | None = None
+    original_class_group_name: str | None = None
+    original_teacher_name: str | None = None
+    replacement_class_group_name: str | None = None
+    replacement_teacher_name: str | None = None
