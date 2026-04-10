@@ -25,6 +25,13 @@ class InlineImage:
     filename: str | None = None
 
 
+@dataclass(frozen=True)
+class EmailAttachment:
+    filename: str
+    data: bytes
+    content_type: str = "application/octet-stream"
+
+
 class EmailSendError(RuntimeError):
     pass
 
@@ -38,6 +45,7 @@ class EmailSender(Protocol):
         text_body: str,
         html_body: str | None = None,
         inline_images: Sequence[InlineImage] | None = None,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> None: ...
 
     def send_verification_email(self, to_email: str, verify_link: str) -> None: ...
@@ -70,6 +78,7 @@ class BaseEmailSender:
         text_body: str,
         html_body: str | None = None,
         inline_images: Sequence[InlineImage] | None = None,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -251,6 +260,7 @@ class ConsoleEmailSender(BaseEmailSender):
         text_body: str,
         html_body: str | None = None,
         inline_images: Sequence[InlineImage] | None = None,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
         print("[EMAIL][DEV]")
         print(f"to={to_email}")
@@ -263,6 +273,12 @@ class ConsoleEmailSender(BaseEmailSender):
             print("[EMAIL][DEV][INLINE_IMAGES]")
             for image in inline_images:
                 print(f"cid={image.cid} content_type={image.content_type} bytes={len(image.data)}")
+        if attachments:
+            print("[EMAIL][DEV][ATTACHMENTS]")
+            for attachment in attachments:
+                print(
+                    f"filename={attachment.filename} content_type={attachment.content_type} bytes={len(attachment.data)}"
+                )
 
 
 class SmtpEmailSender(BaseEmailSender):
@@ -277,6 +293,7 @@ class SmtpEmailSender(BaseEmailSender):
         text_body: str,
         html_body: str | None = None,
         inline_images: Sequence[InlineImage] | None = None,
+        attachments: Sequence[EmailAttachment] | None = None,
     ) -> None:
         msg = EmailMessage()
         msg["Subject"] = subject
@@ -299,6 +316,16 @@ class SmtpEmailSender(BaseEmailSender):
                     cid=f"<{image.cid}>",
                     filename=image.filename or f"{image.cid}.{subtype}",
                     disposition="inline",
+                )
+
+        if attachments:
+            for attachment in attachments:
+                maintype, subtype = _split_content_type(attachment.content_type)
+                msg.add_attachment(
+                    attachment.data,
+                    maintype=maintype,
+                    subtype=subtype,
+                    filename=attachment.filename,
                 )
 
         try:

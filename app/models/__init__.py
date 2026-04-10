@@ -19,6 +19,9 @@ from app.models.student_status_history import StudentStatusHistory  # noqa: F401
 from app.models.teacher import Teacher  # noqa: F401
 from app.models.teacher_availability_exception import TeacherAvailabilityException  # noqa: F401
 from app.models.teacher_availability_rule import TeacherAvailabilityRule  # noqa: F401
+from app.models.teacher_event_report import TeacherEventReport  # noqa: F401
+from app.models.teacher_event_report_absence import TeacherEventReportAbsence  # noqa: F401
+from app.models.teacher_profile_update_request import TeacherProfileUpdateRequest  # noqa: F401
 from app.models.teacher_status_history import TeacherStatusHistory  # noqa: F401
 from app.models.trial_lesson import TrialLesson  # noqa: F401
 from app.models.trial_lesson_extraordinary_request import (  # noqa: F401
