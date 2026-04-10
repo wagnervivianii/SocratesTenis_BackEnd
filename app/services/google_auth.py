@@ -107,6 +107,10 @@ class GoogleAuthService:
                 identity.email_verified = profile.email_verified
                 changed = True
 
+            if profile.avatar_url != getattr(identity, "provider_avatar_url", None):
+                identity.provider_avatar_url = profile.avatar_url
+                changed = True
+
             if normalized_name and not getattr(user, "full_name", None):
                 user.full_name = normalized_name
                 changed = True
@@ -176,6 +180,7 @@ class GoogleAuthService:
             provider_sub=provider_sub,
             provider_email=normalized_email,
             email_verified=profile.email_verified,
+            provider_avatar_url=profile.avatar_url,
         )
         db.add(identity)
         db.commit()

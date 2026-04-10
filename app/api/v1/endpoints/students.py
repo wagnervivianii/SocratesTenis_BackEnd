@@ -21,6 +21,7 @@ from app.schemas.student_imports import (
 )
 from app.schemas.students import (
     StudentCreateIn,
+    StudentHomeOut,
     StudentListItemOut,
     StudentOut,
     StudentStatusChangeIn,
@@ -44,6 +45,16 @@ _IMPORT_HEADERS = [
 
 _BOOLEAN_TRUE_VALUES = {"1", "true", "t", "yes", "y", "sim", "s"}
 _BOOLEAN_FALSE_VALUES = {"0", "false", "f", "no", "n", "nao", "não"}
+
+_WEEKDAY_LABELS = {
+    1: "Segunda-feira",
+    2: "Terça-feira",
+    3: "Quarta-feira",
+    4: "Quinta-feira",
+    5: "Sexta-feira",
+    6: "Sábado",
+    7: "Domingo",
+}
 
 
 def _get_current_user_row(db: Session, user_id: str):
@@ -76,6 +87,470 @@ def _require_admin(db: Session, user_id: str) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Apenas administradores podem gerenciar alunos.",
         )
+
+
+def _require_active_user(db: Session, user_id: str):
+    user = _get_current_user_row(db, user_id)
+    if not user or not user["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuário inválido",
+        )
+    return user
+
+
+def _find_student_by_user_or_email(
+    db: Session,
+    *,
+    user_id: str,
+    email: str | None,
+):
+    direct_match = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  s.id,
+                  s.user_id,
+                  COALESCE(NULLIF(TRIM(s.full_name), ''), NULLIF(TRIM(u.full_name), '')) AS full_name,
+                  COALESCE(NULLIF(TRIM(s.email), ''), NULLIF(TRIM(u.email), '')) AS email,
+                  COALESCE(NULLIF(TRIM(s.phone), ''), NULLIF(TRIM(u.whatsapp), '')) AS phone,
+                  s.notes,
+                  s.profession,
+                  s.instagram_handle,
+                  s.share_profession,
+                  s.share_instagram,
+                  s.is_active,
+                  s.created_at,
+                  s.updated_at,
+                  NULL::text AS avatar_url
+                FROM public.students s
+                LEFT JOIN public.users u
+                  ON u.id = s.user_id
+                WHERE s.user_id = :user_id
+                ORDER BY s.created_at ASC
+                LIMIT 1
+                """
+            ),
+            {"user_id": user_id},
+        )
+        .mappings()
+        .first()
+    )
+    if direct_match:
+        return direct_match
+
+    normalized_email = _normalize_optional_email(email)
+    if not normalized_email:
+        return None
+
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  s.id,
+                  s.user_id,
+                  COALESCE(NULLIF(TRIM(s.full_name), ''), NULLIF(TRIM(u.full_name), '')) AS full_name,
+                  COALESCE(NULLIF(TRIM(s.email), ''), NULLIF(TRIM(u.email), '')) AS email,
+                  COALESCE(NULLIF(TRIM(s.phone), ''), NULLIF(TRIM(u.whatsapp), '')) AS phone,
+                  s.notes,
+                  s.profession,
+                  s.instagram_handle,
+                  s.share_profession,
+                  s.share_instagram,
+                  s.is_active,
+                  s.created_at,
+                  s.updated_at,
+                  NULL::text AS avatar_url
+                FROM public.students s
+                LEFT JOIN public.users u
+                  ON u.id = s.user_id
+                WHERE lower(s.email) = :email
+                ORDER BY s.created_at ASC
+                LIMIT 1
+                """
+            ),
+            {"email": normalized_email},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _get_student_home_class_group_rows(db: Session, *, student_id: UUID):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cge.id AS enrollment_id,
+                  cg.id AS class_group_id,
+                  cg.name AS class_group_name,
+                  cg.class_type AS class_type,
+                  cg.level AS level,
+                  cge.status AS enrollment_status,
+                  cge.starts_on AS enrollment_starts_on,
+                  cge.ends_on AS enrollment_ends_on,
+                  cg.teacher_id AS teacher_id,
+                  t.full_name AS teacher_name,
+                  cg.court_id AS court_id,
+                  c.name AS court_name
+                FROM public.class_group_enrollments cge
+                JOIN public.class_groups cg
+                  ON cg.id = cge.class_group_id
+                LEFT JOIN public.teachers t
+                  ON t.id = cg.teacher_id
+                LEFT JOIN public.courts c
+                  ON c.id = cg.court_id
+                WHERE cge.student_id = :student_id
+                  AND cge.status = 'active'
+                  AND cg.is_active = TRUE
+                  AND cge.starts_on <= current_date
+                  AND (cge.ends_on IS NULL OR cge.ends_on >= current_date)
+                ORDER BY
+                  cg.name ASC,
+                  cge.starts_on ASC,
+                  cge.created_at ASC
+                """
+            ),
+            {"student_id": student_id},
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _get_student_home_schedule_rows(db: Session, *, class_group_ids: list[UUID]):
+    if not class_group_ids:
+        return []
+
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cgs.id AS schedule_id,
+                  cgs.class_group_id AS class_group_id,
+                  cgs.weekday AS weekday,
+                  cgs.start_time AS start_time,
+                  cgs.end_time AS end_time,
+                  cgs.starts_on AS starts_on,
+                  cgs.ends_on AS ends_on,
+                  cgs.is_active AS is_active,
+                  cgs.notes AS notes
+                FROM public.class_group_schedules cgs
+                WHERE cgs.class_group_id = ANY(:class_group_ids)
+                  AND cgs.is_active = TRUE
+                  AND cgs.starts_on <= current_date
+                  AND (cgs.ends_on IS NULL OR cgs.ends_on >= current_date)
+                ORDER BY
+                  cgs.class_group_id ASC,
+                  cgs.weekday ASC,
+                  cgs.start_time ASC
+                """
+            ),
+            {"class_group_ids": class_group_ids},
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _get_student_home_classmate_rows(
+    db: Session,
+    *,
+    class_group_ids: list[UUID],
+    student_id: UUID,
+):
+    if not class_group_ids:
+        return []
+
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cge.class_group_id AS class_group_id,
+                  s.id AS student_id,
+                  COALESCE(NULLIF(TRIM(s.full_name), ''), NULLIF(TRIM(u.full_name), '')) AS full_name,
+                  NULL::text AS avatar_url
+                FROM public.class_group_enrollments cge
+                JOIN public.class_groups cg
+                  ON cg.id = cge.class_group_id
+                JOIN public.students s
+                  ON s.id = cge.student_id
+                LEFT JOIN public.users u
+                  ON u.id = s.user_id
+                WHERE cge.class_group_id = ANY(:class_group_ids)
+                  AND cge.status = 'active'
+                  AND cg.is_active = TRUE
+                  AND cge.starts_on <= current_date
+                  AND (cge.ends_on IS NULL OR cge.ends_on >= current_date)
+                  AND s.id <> :student_id
+                ORDER BY
+                  cge.class_group_id ASC,
+                  full_name ASC
+                """
+            ),
+            {"class_group_ids": class_group_ids, "student_id": student_id},
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _get_student_home_upcoming_rental_rows(
+    db: Session,
+    *,
+    user_id: str,
+    student_id: UUID,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cr.id AS rental_id,
+                  e.court_id AS court_id,
+                  c.name AS court_name,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  cr.status AS status,
+                  cr.payment_status AS payment_status,
+                  cr.payment_evidence_status AS payment_evidence_status,
+                  cr.pricing_profile AS pricing_profile,
+                  cr.billing_mode AS billing_mode,
+                  cr.origin AS origin,
+                  cr.total_amount AS total_amount,
+                  cr.price_per_hour AS price_per_hour,
+                  cr.requested_at AS requested_at,
+                  cr.scheduled_at AS scheduled_at,
+                  cr.confirmed_at AS confirmed_at,
+                  cr.cancelled_at AS cancelled_at,
+                  cr.payment_expires_at AS payment_expires_at
+                FROM public.court_rentals cr
+                JOIN public.events e
+                  ON e.id = cr.event_id
+                LEFT JOIN public.courts c
+                  ON c.id = e.court_id
+                WHERE (
+                  cr.customer_student_id = :student_id
+                  OR COALESCE(cr.customer_user_id, cr.user_id) = :user_id
+                )
+                  AND e.kind = 'locacao'
+                  AND e.end_at > now()
+                  AND cr.status IN (
+                    'requested',
+                    'awaiting_payment',
+                    'awaiting_proof',
+                    'awaiting_admin_review',
+                    'scheduled',
+                    'confirmed'
+                  )
+                ORDER BY
+                  e.start_at ASC,
+                  cr.created_at DESC
+                """
+            ),
+            {"user_id": user_id, "student_id": student_id},
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _get_student_home_recent_rental_history_rows(
+    db: Session,
+    *,
+    user_id: str,
+    student_id: UUID,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cr.id AS rental_id,
+                  e.court_id AS court_id,
+                  c.name AS court_name,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  cr.status AS status,
+                  cr.payment_status AS payment_status,
+                  cr.payment_evidence_status AS payment_evidence_status,
+                  cr.pricing_profile AS pricing_profile,
+                  cr.billing_mode AS billing_mode,
+                  cr.origin AS origin,
+                  cr.total_amount AS total_amount,
+                  cr.price_per_hour AS price_per_hour,
+                  cr.requested_at AS requested_at,
+                  cr.scheduled_at AS scheduled_at,
+                  cr.confirmed_at AS confirmed_at,
+                  cr.cancelled_at AS cancelled_at,
+                  cr.payment_expires_at AS payment_expires_at
+                FROM public.court_rentals cr
+                LEFT JOIN public.events e
+                  ON e.id = cr.event_id
+                LEFT JOIN public.courts c
+                  ON c.id = e.court_id
+                WHERE (
+                  cr.customer_student_id = :student_id
+                  OR COALESCE(cr.customer_user_id, cr.user_id) = :user_id
+                )
+                  AND (
+                    cr.status IN ('cancelled', 'completed', 'rejected')
+                    OR e.end_at <= now()
+                  )
+                ORDER BY
+                  COALESCE(e.start_at, cr.requested_at, cr.created_at) DESC,
+                  cr.created_at DESC
+                LIMIT 10
+                """
+            ),
+            {"user_id": user_id, "student_id": student_id},
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _build_student_home_payload(
+    db: Session,
+    *,
+    user: dict,
+    student_row: dict,
+):
+    class_group_rows = _get_student_home_class_group_rows(db, student_id=student_row["id"])
+    class_group_ids = [row["class_group_id"] for row in class_group_rows]
+
+    schedule_rows = _get_student_home_schedule_rows(db, class_group_ids=class_group_ids)
+    classmate_rows = _get_student_home_classmate_rows(
+        db,
+        class_group_ids=class_group_ids,
+        student_id=student_row["id"],
+    )
+
+    schedules_by_group: dict[UUID, list[dict[str, object]]] = {}
+    for row in schedule_rows:
+        schedules_by_group.setdefault(row["class_group_id"], []).append(
+            {
+                "schedule_id": row["schedule_id"],
+                "weekday": row["weekday"],
+                "weekday_label": _WEEKDAY_LABELS.get(row["weekday"], "Dia não informado"),
+                "start_time": row["start_time"],
+                "end_time": row["end_time"],
+                "starts_on": row["starts_on"],
+                "ends_on": row["ends_on"],
+                "is_active": row["is_active"],
+                "notes": row["notes"],
+            }
+        )
+
+    classmates_by_group: dict[UUID, list[dict[str, object]]] = {}
+    for row in classmate_rows:
+        classmates_by_group.setdefault(row["class_group_id"], []).append(
+            {
+                "student_id": row["student_id"],
+                "full_name": row["full_name"],
+                "avatar_url": row["avatar_url"],
+            }
+        )
+
+    class_groups = [
+        {
+            "enrollment_id": row["enrollment_id"],
+            "class_group_id": row["class_group_id"],
+            "class_group_name": row["class_group_name"],
+            "class_type": row["class_type"],
+            "level": row["level"],
+            "enrollment_status": row["enrollment_status"],
+            "enrollment_starts_on": row["enrollment_starts_on"],
+            "enrollment_ends_on": row["enrollment_ends_on"],
+            "teacher_id": row["teacher_id"],
+            "teacher_name": row["teacher_name"],
+            "court_id": row["court_id"],
+            "court_name": row["court_name"],
+            "classmates": classmates_by_group.get(row["class_group_id"], []),
+            "schedules": schedules_by_group.get(row["class_group_id"], []),
+        }
+        for row in class_group_rows
+    ]
+
+    upcoming_rentals = [
+        {
+            "rental_id": row["rental_id"],
+            "court_id": row["court_id"],
+            "court_name": row["court_name"],
+            "start_at": row["start_at"],
+            "end_at": row["end_at"],
+            "status": row["status"],
+            "payment_status": row["payment_status"],
+            "payment_evidence_status": row["payment_evidence_status"],
+            "pricing_profile": row["pricing_profile"],
+            "billing_mode": row["billing_mode"],
+            "origin": row["origin"],
+            "total_amount": row["total_amount"],
+            "price_per_hour": row["price_per_hour"],
+            "requested_at": row["requested_at"],
+            "scheduled_at": row["scheduled_at"],
+            "confirmed_at": row["confirmed_at"],
+            "cancelled_at": row["cancelled_at"],
+            "payment_expires_at": row["payment_expires_at"],
+        }
+        for row in _get_student_home_upcoming_rental_rows(
+            db,
+            user_id=user["id"],
+            student_id=student_row["id"],
+        )
+    ]
+
+    recent_rental_history = [
+        {
+            "rental_id": row["rental_id"],
+            "court_id": row["court_id"],
+            "court_name": row["court_name"],
+            "start_at": row["start_at"],
+            "end_at": row["end_at"],
+            "status": row["status"],
+            "payment_status": row["payment_status"],
+            "payment_evidence_status": row["payment_evidence_status"],
+            "pricing_profile": row["pricing_profile"],
+            "billing_mode": row["billing_mode"],
+            "origin": row["origin"],
+            "total_amount": row["total_amount"],
+            "price_per_hour": row["price_per_hour"],
+            "requested_at": row["requested_at"],
+            "scheduled_at": row["scheduled_at"],
+            "confirmed_at": row["confirmed_at"],
+            "cancelled_at": row["cancelled_at"],
+            "payment_expires_at": row["payment_expires_at"],
+        }
+        for row in _get_student_home_recent_rental_history_rows(
+            db,
+            user_id=user["id"],
+            student_id=student_row["id"],
+        )
+    ]
+
+    return {
+        "profile": {
+            "id": student_row["id"],
+            "user_id": student_row["user_id"],
+            "full_name": student_row["full_name"],
+            "email": student_row["email"],
+            "phone": student_row["phone"],
+            "profession": student_row["profession"],
+            "instagram_handle": student_row["instagram_handle"],
+            "share_profession": student_row["share_profession"],
+            "share_instagram": student_row["share_instagram"],
+            "is_active": student_row["is_active"],
+            "avatar_url": student_row["avatar_url"],
+        },
+        "class_groups": class_groups,
+        "upcoming_rentals": upcoming_rentals,
+        "recent_rental_history": recent_rental_history,
+    }
 
 
 def _integrity_to_http(e: IntegrityError) -> HTTPException:
@@ -692,6 +1167,29 @@ def commit_student_import(
         invalid_rows=0,
         rows=preview.rows,
     )
+
+
+@router.get("/me/home", response_model=StudentHomeOut)
+def get_student_home(
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    user = _require_active_user(db, user_id)
+    student_row = _find_student_by_user_or_email(db, user_id=user_id, email=user["email"])
+
+    if not student_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhum aluno vinculado foi encontrado para este usuário.",
+        )
+
+    if not student_row["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="O cadastro deste aluno está inativo no momento.",
+        )
+
+    return _build_student_home_payload(db, user=user, student_row=student_row)
 
 
 @router.get("/", response_model=list[StudentListItemOut])

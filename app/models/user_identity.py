@@ -39,6 +39,7 @@ class UserIdentity(Base):
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     provider_sub: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     provider_email: Mapped[str | None] = mapped_column(CITEXT(), nullable=True)
+    provider_avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     email_verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(

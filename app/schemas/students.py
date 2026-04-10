@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -63,3 +64,80 @@ class StudentStatusHistoryItemOut(BaseModel):
     reason_note: str | None = None
     changed_by_user_id: UUID | None = None
     created_at: datetime
+
+
+class StudentHomeProfileOut(BaseModel):
+    id: UUID
+    user_id: UUID | None = None
+    full_name: str
+    email: str | None = None
+    phone: str | None = None
+    profession: str | None = None
+    instagram_handle: str | None = None
+    share_profession: bool
+    share_instagram: bool
+    is_active: bool
+    avatar_url: str | None = None
+
+
+class StudentHomeClassmateOut(BaseModel):
+    student_id: UUID
+    full_name: str
+    avatar_url: str | None = None
+
+
+class StudentHomeScheduleOut(BaseModel):
+    schedule_id: UUID
+    weekday: int
+    weekday_label: str
+    start_time: time
+    end_time: time
+    starts_on: date
+    ends_on: date | None = None
+    is_active: bool
+    notes: str | None = None
+
+
+class StudentHomeClassGroupOut(BaseModel):
+    enrollment_id: UUID
+    class_group_id: UUID
+    class_group_name: str
+    class_type: str
+    level: str
+    enrollment_status: str
+    enrollment_starts_on: date
+    enrollment_ends_on: date | None = None
+    teacher_id: UUID | None = None
+    teacher_name: str | None = None
+    court_id: UUID | None = None
+    court_name: str | None = None
+    classmates: list[StudentHomeClassmateOut] = Field(default_factory=list)
+    schedules: list[StudentHomeScheduleOut] = Field(default_factory=list)
+
+
+class StudentHomeRentalOut(BaseModel):
+    rental_id: UUID
+    court_id: UUID | None = None
+    court_name: str | None = None
+    start_at: datetime
+    end_at: datetime
+    status: str
+    payment_status: str
+    payment_evidence_status: str | None = None
+    pricing_profile: str
+    billing_mode: str
+    origin: str
+    total_amount: Decimal | None = None
+    price_per_hour: Decimal | None = None
+    requested_at: datetime
+    scheduled_at: datetime | None = None
+    confirmed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    payment_expires_at: datetime | None = None
+
+
+class StudentHomeOut(BaseModel):
+    profile: StudentHomeProfileOut
+    class_groups: list[StudentHomeClassGroupOut] = Field(default_factory=list)
+    upcoming_rentals: list[StudentHomeRentalOut] = Field(default_factory=list)
+    recent_rental_history: list[StudentHomeRentalOut] = Field(default_factory=list)
