@@ -7,6 +7,8 @@ from typing import Literal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.student import Student
+from app.models.teacher import Teacher
 from app.models.user import User
 from app.models.user_identity import UserIdentity
 
@@ -66,11 +68,71 @@ class GoogleAuthService:
     - localizar usuário por e-mail
     - vincular conta Google a usuário já existente
     - criar usuário + identidade quando necessário
+    - sincronizar o vínculo do user com perfis gerenciados (teacher/student)
 
     Não cria rota, não gera token JWT e não mexe no front.
     """
 
     provider: GoogleProvider = "google"
+
+    def _find_teacher_by_email(self, db: Session, *, email: str) -> Teacher | None:
+        return db.scalar(select(Teacher).where(Teacher.email == email))
+
+    def _find_student_by_email(self, db: Session, *, email: str) -> Student | None:
+        return db.scalar(select(Student).where(Student.email == email))
+
+    def _sync_managed_profile_links(
+        self,
+        db: Session,
+        *,
+        user: User,
+        normalized_email: str | None,
+    ) -> bool:
+        if not normalized_email:
+            return False
+
+        changed = False
+        normalized_role = (getattr(user, "role", "") or "").strip().lower()
+
+        teacher = self._find_teacher_by_email(db, email=normalized_email)
+        if teacher is not None:
+            if teacher.user_id is None:
+                teacher.user_id = user.id
+                changed = True
+            elif teacher.user_id != user.id:
+                raise GoogleAuthError(
+                    "Já existe outro usuário vinculado a este professor. Revise o cadastro antes de continuar."
+                )
+
+            if normalized_role != "admin" and user.role != "coach":
+                user.role = "coach"
+                changed = True
+
+            if not getattr(user, "full_name", None) and teacher.full_name:
+                user.full_name = teacher.full_name
+                changed = True
+
+            return changed
+
+        student = self._find_student_by_email(db, email=normalized_email)
+        if student is not None:
+            if student.user_id is None:
+                student.user_id = user.id
+                changed = True
+            elif student.user_id != user.id:
+                raise GoogleAuthError(
+                    "Já existe outro usuário vinculado a este aluno. Revise o cadastro antes de continuar."
+                )
+
+            if normalized_role != "admin" and normalized_role != "coach" and user.role != "student":
+                user.role = "student"
+                changed = True
+
+            if not getattr(user, "full_name", None) and student.full_name:
+                user.full_name = student.full_name
+                changed = True
+
+        return changed
 
     def resolve_or_create_user(
         self,
@@ -117,6 +179,13 @@ class GoogleAuthService:
 
             if profile.email_verified and getattr(user, "email_verified_at", None) is None:
                 user.email_verified_at = now
+                changed = True
+
+            if self._sync_managed_profile_links(
+                db,
+                user=user,
+                normalized_email=normalized_email,
+            ):
                 changed = True
 
             if changed:
@@ -171,8 +240,22 @@ class GoogleAuthService:
                 user.email_verified_at = now
                 changed = True
 
+            if self._sync_managed_profile_links(
+                db,
+                user=user,
+                normalized_email=normalized_email,
+            ):
+                changed = True
+
             if changed:
                 db.flush()
+
+        if created_user and self._sync_managed_profile_links(
+            db,
+            user=user,
+            normalized_email=normalized_email,
+        ):
+            db.flush()
 
         identity = UserIdentity(
             user_id=user.id,

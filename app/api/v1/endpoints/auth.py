@@ -21,6 +21,8 @@ from app.core.security import (
     verify_password,
 )
 from app.db.session import get_db
+from app.models.student import Student
+from app.models.teacher import Teacher
 from app.models.user import User
 from app.models.user_identity import UserIdentity
 from app.schemas.auth import (
@@ -84,6 +86,40 @@ def _clear_refresh_cookie(response: Response) -> None:
         path=settings.refresh_cookie_path,
         domain=settings.refresh_cookie_domain,
     )
+
+
+def _resolve_me_full_name(db: Session, user: User) -> str | None:
+    direct_name = (getattr(user, "full_name", None) or "").strip()
+    if direct_name:
+        return direct_name
+
+    teacher_name = db.execute(
+        select(Teacher.full_name).where(Teacher.user_id == user.id)
+    ).scalar_one_or_none()
+    teacher_name = (teacher_name or "").strip() if teacher_name is not None else ""
+    if teacher_name:
+        return " ".join(teacher_name.split())
+
+    student_name = db.execute(
+        select(Student.full_name).where(Student.user_id == user.id)
+    ).scalar_one_or_none()
+    student_name = (student_name or "").strip() if student_name is not None else ""
+    if student_name:
+        return " ".join(student_name.split())
+
+    fallback_email = (getattr(user, "email", None) or "").strip()
+    if fallback_email:
+        return fallback_email.split("@", 1)[0] or fallback_email
+
+    return None
+
+
+def _resolve_me_avatar_url(google_identity: UserIdentity | None) -> str | None:
+    if google_identity is None:
+        return None
+
+    avatar_url = (getattr(google_identity, "provider_avatar_url", None) or "").strip()
+    return avatar_url or None
 
 
 def _only_digits(s: str) -> str:
@@ -957,16 +993,12 @@ def me(user_id: str = Depends(get_current_user_id), db: DBSession = None):
     return MeOut(
         user_id=str(user.id),
         email=user.email,
-        full_name=user.full_name,
+        full_name=_resolve_me_full_name(db, user),
         role=user.role,
         is_active=user.is_active,
         email_verified=user.email_verified_at is not None,
         auth_provider=auth_provider,
-        avatar_url=(
-            getattr(google_identity, "provider_avatar_url", None)
-            if google_identity is not None
-            else None
-        ),
+        avatar_url=_resolve_me_avatar_url(google_identity),
         has_password=has_password,
         whatsapp=user.whatsapp,
         instagram=user.instagram,
