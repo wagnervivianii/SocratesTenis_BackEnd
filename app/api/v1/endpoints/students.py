@@ -958,6 +958,127 @@ def _create_student_makeup_request(
     )
 
 
+def _list_student_makeup_original_lesson_options(
+    db: Session,
+    *,
+    student_id: UUID,
+    q: str | None = None,
+    from_date: date | None = None,
+    limit: int = 20,
+):
+    params: dict[str, object] = {
+        "student_id": student_id,
+        "limit": max(1, min(limit, 100)),
+    }
+
+    where_parts = [
+        "cge.student_id = :student_id",
+        "cge.status = 'active'",
+        "cg.is_active = TRUE",
+        "e.kind = 'group_lesson'",
+        "e.start_at > (now() + interval '24 hours')",
+        "cge.starts_on <= (e.start_at AT TIME ZONE 'America/Sao_Paulo')::date",
+        "(cge.ends_on IS NULL OR cge.ends_on >= (e.start_at AT TIME ZONE 'America/Sao_Paulo')::date)",
+        """
+        NOT EXISTS (
+          SELECT 1
+          FROM public.student_makeup_requests smr
+          WHERE smr.student_id = cge.student_id
+            AND smr.original_event_id = e.id
+            AND smr.status IN ('pending', 'scheduled')
+        )
+        """,
+    ]
+
+    if from_date is not None:
+        params["from_date"] = from_date
+        where_parts.append("(e.start_at AT TIME ZONE 'America/Sao_Paulo')::date >= :from_date")
+
+    if q and q.strip():
+        params["q"] = f"%{q.strip()}%"
+        where_parts.append(
+            """
+            (
+              cg.name ILIKE :q
+              OR COALESCE(cg.class_type, '') ILIKE :q
+              OR COALESCE(cg.level, '') ILIKE :q
+              OR COALESCE(t.full_name, '') ILIKE :q
+              OR COALESCE(c.name, '') ILIKE :q
+            )
+            """
+        )
+
+    rows = (
+        db.execute(
+            text(
+                f"""
+                WITH active AS (
+                  SELECT
+                    cge.class_group_id,
+                    COUNT(*)::int AS active_enrollments
+                  FROM public.class_group_enrollments cge
+                  WHERE cge.status = 'active'
+                  GROUP BY cge.class_group_id
+                ),
+                candidate_lessons AS (
+                  SELECT DISTINCT ON (e.id)
+                    e.id AS event_id,
+                    e.class_group_id AS class_group_id,
+                    cg.name AS class_group_name,
+                    cg.class_type AS class_type,
+                    cg.level AS level,
+                    cg.teacher_id AS teacher_id,
+                    t.full_name AS teacher_name,
+                    cg.court_id AS court_id,
+                    c.name AS court_name,
+                    (e.start_at AT TIME ZONE 'America/Sao_Paulo')::date AS lesson_date,
+                    e.start_at AS start_at,
+                    e.end_at AS end_at,
+                    cg.capacity AS capacity,
+                    COALESCE(active.active_enrollments, 0) AS active_enrollments
+                  FROM public.class_group_enrollments cge
+                  JOIN public.class_groups cg
+                    ON cg.id = cge.class_group_id
+                  JOIN public.events e
+                    ON e.class_group_id = cge.class_group_id
+                  LEFT JOIN active
+                    ON active.class_group_id = cg.id
+                  LEFT JOIN public.teachers t
+                    ON t.id = cg.teacher_id
+                  LEFT JOIN public.courts c
+                    ON c.id = cg.court_id
+                  WHERE {" AND ".join(where_parts)}
+                  ORDER BY e.id, e.start_at ASC, cg.name ASC
+                )
+                SELECT
+                  event_id,
+                  class_group_id,
+                  class_group_name,
+                  class_type,
+                  level,
+                  teacher_id,
+                  teacher_name,
+                  court_id,
+                  court_name,
+                  lesson_date,
+                  start_at,
+                  end_at,
+                  capacity,
+                  active_enrollments
+                FROM candidate_lessons
+                ORDER BY start_at ASC, class_group_name ASC
+                LIMIT :limit
+                """
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+
+    return [StudentMakeupReplacementLessonOptionOut(**row) for row in rows]
+
+
 def _list_student_makeup_requests(
     db: Session,
     *,
@@ -2069,10 +2190,13 @@ def create_student_makeup_request_from_portal(
             detail="Aula original não encontrada para a matrícula informada.",
         )
 
-    if original_lesson["start_at"] <= db.execute(text("SELECT now()")).scalar_one():
+    if (
+        original_lesson["start_at"]
+        <= db.execute(text("SELECT now() + interval '24 hours'")).scalar_one()
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Só é possível pedir reposição para aulas futuras.",
+            detail="Só é possível pedir reposição com pelo menos 24 horas de antecedência.",
         )
 
     duplicate_request = _find_active_makeup_request_for_event(
@@ -2260,6 +2384,50 @@ def get_student_home(
         )
 
     return _build_student_home_payload(db, user=user, student_row=student_row)
+
+
+@router.get(
+    "/me/makeup-request-options",
+    response_model=list[StudentMakeupReplacementLessonOptionOut],
+)
+def list_student_makeup_original_lesson_options_from_portal(
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    q: Annotated[
+        str | None,
+        Query(description="Busca por turma, tipo, nível, professor ou quadra"),
+    ] = None,
+    from_date: Annotated[
+        date | None,
+        Query(description="Filtra as aulas a partir desta data"),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=100, description="Quantidade máxima de aulas retornadas"),
+    ] = 20,
+):
+    user = _require_active_user(db, user_id)
+    student_row = _find_student_by_user_or_email(db, user_id=user_id, email=user["email"])
+
+    if not student_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhum aluno vinculado foi encontrado para este usuário.",
+        )
+
+    if not student_row["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="O cadastro deste aluno está inativo no momento.",
+        )
+
+    return _list_student_makeup_original_lesson_options(
+        db,
+        student_id=student_row["id"],
+        q=q,
+        from_date=from_date,
+        limit=limit,
+    )
 
 
 @router.get("/me/makeup-requests", response_model=list[StudentMakeupRequestListItemOut])

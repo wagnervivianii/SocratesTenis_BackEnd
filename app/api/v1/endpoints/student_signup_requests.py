@@ -324,11 +324,50 @@ def _create_or_update_user_for_approved_request(
     return existing_user
 
 
+def _insert_student_status_history(
+    db: Session,
+    *,
+    student_id: UUID,
+    status_value: str,
+    changed_by_user_id: str,
+    reason_code: str | None = None,
+    reason_note: str | None = None,
+) -> None:
+    db.execute(
+        text(
+            """
+            INSERT INTO public.student_status_history (
+              student_id,
+              status,
+              reason_code,
+              reason_note,
+              changed_by_user_id
+            )
+            VALUES (
+              :student_id,
+              :status,
+              :reason_code,
+              :reason_note,
+              :changed_by_user_id
+            )
+            """
+        ),
+        {
+            "student_id": student_id,
+            "status": status_value,
+            "reason_code": reason_code.strip() if reason_code else None,
+            "reason_note": reason_note.strip() if reason_note else None,
+            "changed_by_user_id": changed_by_user_id,
+        },
+    )
+
+
 def _create_or_update_student_for_approved_request(
     *,
     db: Session,
     request: StudentSignupRequest,
     user: User,
+    reviewed_by_user_id: str,
 ) -> Student:
     existing_student = db.scalar(select(Student).where(Student.email == request.email))
 
@@ -347,7 +386,17 @@ def _create_or_update_student_for_approved_request(
         )
         db.add(student)
         db.flush()
+        _insert_student_status_history(
+            db,
+            student_id=student.id,
+            status_value="active",
+            changed_by_user_id=reviewed_by_user_id,
+            reason_code="signup_approved",
+            reason_note="Aluno criado a partir da aprovação da solicitação pública de cadastro.",
+        )
         return student
+
+    was_active = bool(existing_student.is_active)
 
     if existing_student.user_id is None:
         existing_student.user_id = user.id
@@ -356,6 +405,17 @@ def _create_or_update_student_for_approved_request(
     existing_student.phone = existing_student.phone or request.whatsapp
     existing_student.instagram_handle = existing_student.instagram_handle or request.instagram
     existing_student.is_active = True
+
+    if not was_active:
+        db.flush()
+        _insert_student_status_history(
+            db,
+            student_id=existing_student.id,
+            status_value="active",
+            changed_by_user_id=reviewed_by_user_id,
+            reason_code="signup_approved",
+            reason_note="Aluno reativado a partir da aprovação da solicitação pública de cadastro.",
+        )
 
     return existing_student
 
@@ -610,7 +670,12 @@ def review_student_signup_request(
         return StudentSignupRequestReviewOut(**review_payload)
 
     user = _create_or_update_user_for_approved_request(db=db, request=request)
-    student = _create_or_update_student_for_approved_request(db=db, request=request, user=user)
+    student = _create_or_update_student_for_approved_request(
+        db=db,
+        request=request,
+        user=user,
+        reviewed_by_user_id=user_id,
+    )
 
     request.status = "approved"
     request.approved_user_id = user.id
