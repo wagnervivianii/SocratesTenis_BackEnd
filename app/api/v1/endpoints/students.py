@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 from collections import Counter
+from datetime import date
 from typing import Annotated
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user_id
+from app.core.config import settings
 from app.db.session import get_db
 from app.schemas.student_imports import (
     StudentImportCommitOut,
@@ -23,10 +25,22 @@ from app.schemas.students import (
     StudentCreateIn,
     StudentHomeOut,
     StudentListItemOut,
+    StudentMakeupReplacementLessonOptionOut,
+    StudentMakeupRequestAdminCreateIn,
+    StudentMakeupRequestCreateIn,
+    StudentMakeupRequestListItemOut,
+    StudentMakeupRequestOut,
+    StudentMakeupRequestReviewIn,
     StudentOut,
     StudentStatusChangeIn,
     StudentStatusHistoryItemOut,
     StudentUpdateIn,
+)
+from app.services.email_sender import (
+    ConsoleEmailSender,
+    EmailSendError,
+    SmtpConfig,
+    SmtpEmailSender,
 )
 
 router = APIRouter(prefix="/students")
@@ -55,6 +69,20 @@ _WEEKDAY_LABELS = {
     6: "Sábado",
     7: "Domingo",
 }
+
+
+def _get_email_sender():
+    if settings.email_sender_backend.lower() == "smtp":
+        cfg = SmtpConfig(
+            host=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_username,
+            password=settings.smtp_password,
+            mail_from=settings.smtp_from,
+            use_tls=settings.smtp_use_tls,
+        )
+        return SmtpEmailSender(cfg)
+    return ConsoleEmailSender()
 
 
 def _get_current_user_row(db: Session, user_id: str):
@@ -551,6 +579,834 @@ def _build_student_home_payload(
         "upcoming_rentals": upcoming_rentals,
         "recent_rental_history": recent_rental_history,
     }
+
+
+def _get_student_makeup_original_lesson_context(
+    db: Session,
+    *,
+    student_id: UUID,
+    class_group_enrollment_id: UUID,
+    original_event_id: UUID | None,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cge.id AS class_group_enrollment_id,
+                  cge.student_id AS student_id,
+                  cge.class_group_id AS class_group_id,
+                  cg.name AS class_group_name,
+                  cg.teacher_id AS teacher_id,
+                  t.full_name AS teacher_name,
+                  cg.court_id AS court_id,
+                  c.name AS court_name,
+                  e.id AS event_id,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  (e.start_at AT TIME ZONE 'America/Sao_Paulo')::date AS lesson_date
+                FROM public.class_group_enrollments cge
+                JOIN public.class_groups cg
+                  ON cg.id = cge.class_group_id
+                JOIN public.events e
+                  ON e.id = :original_event_id
+                 AND e.class_group_id = cge.class_group_id
+                LEFT JOIN public.teachers t
+                  ON t.id = cg.teacher_id
+                LEFT JOIN public.courts c
+                  ON c.id = cg.court_id
+                WHERE cge.id = :class_group_enrollment_id
+                  AND cge.student_id = :student_id
+                  AND cge.status = 'active'
+                  AND cg.is_active = TRUE
+                  AND e.kind = 'group_lesson'
+                LIMIT 1
+                """
+            ),
+            {
+                "student_id": student_id,
+                "class_group_enrollment_id": class_group_enrollment_id,
+                "original_event_id": original_event_id,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _get_student_makeup_enrollment_context(
+    db: Session,
+    *,
+    student_id: UUID,
+    class_group_enrollment_id: UUID,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  cge.id AS class_group_enrollment_id,
+                  cge.student_id AS student_id,
+                  s.full_name AS student_name,
+                  COALESCE(NULLIF(TRIM(s.email), ''), NULLIF(TRIM(u.email), '')) AS student_email,
+                  s.is_active AS student_is_active,
+                  cge.class_group_id AS class_group_id,
+                  cg.name AS class_group_name,
+                  cg.teacher_id AS teacher_id,
+                  t.full_name AS teacher_name,
+                  cg.court_id AS court_id,
+                  c.name AS court_name
+                FROM public.class_group_enrollments cge
+                JOIN public.students s
+                  ON s.id = cge.student_id
+                LEFT JOIN public.users u
+                  ON u.id = s.user_id
+                JOIN public.class_groups cg
+                  ON cg.id = cge.class_group_id
+                LEFT JOIN public.teachers t
+                  ON t.id = cg.teacher_id
+                LEFT JOIN public.courts c
+                  ON c.id = cg.court_id
+                WHERE cge.id = :class_group_enrollment_id
+                  AND cge.student_id = :student_id
+                  AND cge.status = 'active'
+                  AND cg.is_active = TRUE
+                LIMIT 1
+                """
+            ),
+            {
+                "student_id": student_id,
+                "class_group_enrollment_id": class_group_enrollment_id,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _find_active_makeup_request_for_snapshot(
+    db: Session,
+    *,
+    student_id: UUID,
+    class_group_enrollment_id: UUID,
+    original_lesson_date,
+    original_start_at,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT id, status
+                FROM public.student_makeup_requests
+                WHERE student_id = :student_id
+                  AND class_group_enrollment_id = :class_group_enrollment_id
+                  AND original_lesson_date = :original_lesson_date
+                  AND original_start_at = :original_start_at
+                  AND status IN ('pending', 'scheduled')
+                ORDER BY requested_at DESC, created_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "student_id": student_id,
+                "class_group_enrollment_id": class_group_enrollment_id,
+                "original_lesson_date": original_lesson_date,
+                "original_start_at": original_start_at,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _get_student_makeup_request_notification_context(
+    db: Session,
+    *,
+    makeup_request_id: UUID,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  smr.id,
+                  smr.status,
+                  smr.source,
+                  smr.original_start_at,
+                  smr.replacement_start_at,
+                  s.full_name AS student_name,
+                  COALESCE(NULLIF(TRIM(s.email), ''), NULLIF(TRIM(u.email), '')) AS student_email,
+                  ocg.name AS original_class_group_name,
+                  rcg.name AS replacement_class_group_name
+                FROM public.student_makeup_requests smr
+                JOIN public.students s
+                  ON s.id = smr.student_id
+                LEFT JOIN public.users u
+                  ON u.id = s.user_id
+                LEFT JOIN public.class_groups ocg
+                  ON ocg.id = smr.original_class_group_id
+                LEFT JOIN public.class_groups rcg
+                  ON rcg.id = smr.replacement_class_group_id
+                WHERE smr.id = :makeup_request_id
+                LIMIT 1
+                """
+            ),
+            {"makeup_request_id": makeup_request_id},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _send_student_makeup_request_received_email(
+    db: Session,
+    *,
+    makeup_request_id: UUID,
+) -> None:
+    context = _get_student_makeup_request_notification_context(
+        db, makeup_request_id=makeup_request_id
+    )
+    if not context or not context["student_email"]:
+        return
+
+    sender = _get_email_sender()
+    try:
+        sender.send_student_makeup_request_received_email(
+            to_email=context["student_email"],
+            student_name=context["student_name"],
+            original_class_group_name=context["original_class_group_name"],
+            original_start_at=context["original_start_at"],
+        )
+    except EmailSendError as exc:
+        print(
+            f"[EMAIL][STUDENT_MAKEUP][RECEIVED][ERROR] to={context['student_email']} request={makeup_request_id} err={exc}"
+        )
+
+
+def _send_student_makeup_request_status_email(
+    db: Session,
+    *,
+    makeup_request_id: UUID,
+) -> None:
+    context = _get_student_makeup_request_notification_context(
+        db, makeup_request_id=makeup_request_id
+    )
+    if not context or not context["student_email"]:
+        return
+
+    sender = _get_email_sender()
+    try:
+        if context["status"] == "scheduled":
+            sender.send_student_makeup_request_scheduled_email(
+                to_email=context["student_email"],
+                student_name=context["student_name"],
+                original_class_group_name=context["original_class_group_name"],
+                original_start_at=context["original_start_at"],
+                replacement_class_group_name=context["replacement_class_group_name"],
+                replacement_start_at=context["replacement_start_at"],
+            )
+        elif context["status"] == "rejected":
+            sender.send_student_makeup_request_rejected_email(
+                to_email=context["student_email"],
+                student_name=context["student_name"],
+                original_class_group_name=context["original_class_group_name"],
+                original_start_at=context["original_start_at"],
+            )
+        elif context["status"] == "cancelled":
+            sender.send_student_makeup_request_cancelled_email(
+                to_email=context["student_email"],
+                student_name=context["student_name"],
+                original_class_group_name=context["original_class_group_name"],
+                original_start_at=context["original_start_at"],
+            )
+    except EmailSendError as exc:
+        print(
+            f"[EMAIL][STUDENT_MAKEUP][{str(context['status']).upper()}][ERROR] to={context['student_email']} request={makeup_request_id} err={exc}"
+        )
+
+
+def _find_active_makeup_request_for_event(
+    db: Session,
+    *,
+    student_id: UUID,
+    original_event_id: UUID,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT id, status
+                FROM public.student_makeup_requests
+                WHERE student_id = :student_id
+                  AND original_event_id = :original_event_id
+                  AND status IN ('pending', 'scheduled')
+                ORDER BY requested_at DESC, created_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "student_id": student_id,
+                "original_event_id": original_event_id,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _create_student_makeup_request(
+    db: Session,
+    *,
+    student_id: UUID,
+    class_group_enrollment_id: UUID,
+    requested_by_user_id: str,
+    source: str,
+    original_event_id: UUID,
+    original_class_group_id: UUID,
+    original_teacher_id: UUID | None,
+    original_court_id: UUID | None,
+    original_lesson_date,
+    original_start_at,
+    original_end_at,
+    student_note: str | None,
+    admin_note: str | None = None,
+):
+    return (
+        db.execute(
+            text(
+                """
+                INSERT INTO public.student_makeup_requests (
+                  student_id,
+                  class_group_enrollment_id,
+                  requested_by_user_id,
+                  source,
+                  status,
+                  original_event_id,
+                  original_class_group_id,
+                  original_teacher_id,
+                  original_court_id,
+                  original_lesson_date,
+                  original_start_at,
+                  original_end_at,
+                  student_note,
+                  admin_note
+                )
+                VALUES (
+                  :student_id,
+                  :class_group_enrollment_id,
+                  :requested_by_user_id,
+                  :source,
+                  'pending',
+                  :original_event_id,
+                  :original_class_group_id,
+                  :original_teacher_id,
+                  :original_court_id,
+                  :original_lesson_date,
+                  :original_start_at,
+                  :original_end_at,
+                  :student_note,
+                  :admin_note
+                )
+                RETURNING
+                  id,
+                  student_id,
+                  class_group_enrollment_id,
+                  requested_by_user_id,
+                  processed_by_user_id,
+                  source,
+                  status,
+                  original_event_id,
+                  original_class_group_id,
+                  original_teacher_id,
+                  original_court_id,
+                  original_lesson_date,
+                  original_start_at,
+                  original_end_at,
+                  replacement_event_id,
+                  replacement_class_group_id,
+                  replacement_teacher_id,
+                  replacement_court_id,
+                  replacement_lesson_date,
+                  replacement_start_at,
+                  replacement_end_at,
+                  student_note,
+                  admin_note,
+                  requested_at,
+                  processed_at,
+                  created_at,
+                  updated_at
+                """
+            ),
+            {
+                "student_id": student_id,
+                "class_group_enrollment_id": class_group_enrollment_id,
+                "requested_by_user_id": requested_by_user_id,
+                "source": source,
+                "original_event_id": original_event_id,
+                "original_class_group_id": original_class_group_id,
+                "original_teacher_id": original_teacher_id,
+                "original_court_id": original_court_id,
+                "original_lesson_date": original_lesson_date,
+                "original_start_at": original_start_at,
+                "original_end_at": original_end_at,
+                "student_note": student_note,
+                "admin_note": admin_note,
+            },
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _list_student_makeup_requests(
+    db: Session,
+    *,
+    student_id: UUID,
+):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  smr.id,
+                  smr.student_id,
+                  smr.class_group_enrollment_id,
+                  smr.requested_by_user_id,
+                  smr.processed_by_user_id,
+                  smr.source,
+                  smr.status,
+                  smr.original_event_id,
+                  smr.original_class_group_id,
+                  smr.original_teacher_id,
+                  smr.original_court_id,
+                  smr.original_lesson_date,
+                  smr.original_start_at,
+                  smr.original_end_at,
+                  smr.replacement_event_id,
+                  smr.replacement_class_group_id,
+                  smr.replacement_teacher_id,
+                  smr.replacement_court_id,
+                  smr.replacement_lesson_date,
+                  smr.replacement_start_at,
+                  smr.replacement_end_at,
+                  smr.student_note,
+                  smr.admin_note,
+                  smr.requested_at,
+                  smr.processed_at,
+                  smr.created_at,
+                  smr.updated_at,
+                  s.full_name AS student_name,
+                  ocg.name AS original_class_group_name,
+                  ot.full_name AS original_teacher_name,
+                  rcg.name AS replacement_class_group_name,
+                  rt.full_name AS replacement_teacher_name
+                FROM public.student_makeup_requests smr
+                JOIN public.students s
+                  ON s.id = smr.student_id
+                LEFT JOIN public.class_groups ocg
+                  ON ocg.id = smr.original_class_group_id
+                LEFT JOIN public.teachers ot
+                  ON ot.id = smr.original_teacher_id
+                LEFT JOIN public.class_groups rcg
+                  ON rcg.id = smr.replacement_class_group_id
+                LEFT JOIN public.teachers rt
+                  ON rt.id = smr.replacement_teacher_id
+                WHERE smr.student_id = :student_id
+                ORDER BY smr.requested_at DESC, smr.created_at DESC
+                """
+            ),
+            {
+                "student_id": student_id,
+            },
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _list_admin_student_makeup_requests(
+    db: Session,
+    *,
+    status_filter: str | None = None,
+    student_id: UUID | None = None,
+    q: str | None = None,
+):
+    params: dict[str, object] = {}
+    where_parts = ["1 = 1"]
+
+    normalized_status = status_filter.strip() if status_filter and status_filter.strip() else None
+    if normalized_status:
+        params["status"] = normalized_status
+        where_parts.append("smr.status = :status")
+
+    if student_id is not None:
+        params["student_id"] = student_id
+        where_parts.append("smr.student_id = :student_id")
+
+    if q and q.strip():
+        params["q"] = f"%{q.strip()}%"
+        where_parts.append(
+            """
+            (
+              s.full_name ILIKE :q
+              OR COALESCE(ocg.name, '') ILIKE :q
+              OR COALESCE(ot.full_name, '') ILIKE :q
+              OR COALESCE(rcg.name, '') ILIKE :q
+              OR COALESCE(rt.full_name, '') ILIKE :q
+            )
+            """
+        )
+
+    where_sql = " AND ".join(where_parts)
+
+    return (
+        db.execute(
+            text(
+                f"""
+                SELECT
+                  smr.id,
+                  smr.student_id,
+                  smr.class_group_enrollment_id,
+                  smr.requested_by_user_id,
+                  smr.processed_by_user_id,
+                  smr.source,
+                  smr.status,
+                  smr.original_event_id,
+                  smr.original_class_group_id,
+                  smr.original_teacher_id,
+                  smr.original_court_id,
+                  smr.original_lesson_date,
+                  smr.original_start_at,
+                  smr.original_end_at,
+                  smr.replacement_event_id,
+                  smr.replacement_class_group_id,
+                  smr.replacement_teacher_id,
+                  smr.replacement_court_id,
+                  smr.replacement_lesson_date,
+                  smr.replacement_start_at,
+                  smr.replacement_end_at,
+                  smr.student_note,
+                  smr.admin_note,
+                  smr.requested_at,
+                  smr.processed_at,
+                  smr.created_at,
+                  smr.updated_at,
+                  s.full_name AS student_name,
+                  ocg.name AS original_class_group_name,
+                  ot.full_name AS original_teacher_name,
+                  rcg.name AS replacement_class_group_name,
+                  rt.full_name AS replacement_teacher_name
+                FROM public.student_makeup_requests smr
+                JOIN public.students s
+                  ON s.id = smr.student_id
+                LEFT JOIN public.class_groups ocg
+                  ON ocg.id = smr.original_class_group_id
+                LEFT JOIN public.teachers ot
+                  ON ot.id = smr.original_teacher_id
+                LEFT JOIN public.class_groups rcg
+                  ON rcg.id = smr.replacement_class_group_id
+                LEFT JOIN public.teachers rt
+                  ON rt.id = smr.replacement_teacher_id
+                WHERE {where_sql}
+                ORDER BY
+                  CASE smr.status
+                    WHEN 'pending' THEN 0
+                    WHEN 'scheduled' THEN 1
+                    WHEN 'rejected' THEN 2
+                    WHEN 'cancelled' THEN 3
+                    ELSE 9
+                  END,
+                  smr.requested_at DESC,
+                  smr.created_at DESC
+                """
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _get_student_makeup_request_detail(db: Session, *, makeup_request_id: UUID):
+    return (
+        db.execute(
+            text(
+                """
+                SELECT
+                  smr.id,
+                  smr.student_id,
+                  smr.class_group_enrollment_id,
+                  smr.requested_by_user_id,
+                  smr.processed_by_user_id,
+                  smr.source,
+                  smr.status,
+                  smr.original_event_id,
+                  smr.original_class_group_id,
+                  smr.original_teacher_id,
+                  smr.original_court_id,
+                  smr.original_lesson_date,
+                  smr.original_start_at,
+                  smr.original_end_at,
+                  smr.replacement_event_id,
+                  smr.replacement_class_group_id,
+                  smr.replacement_teacher_id,
+                  smr.replacement_court_id,
+                  smr.replacement_lesson_date,
+                  smr.replacement_start_at,
+                  smr.replacement_end_at,
+                  smr.student_note,
+                  smr.admin_note,
+                  smr.requested_at,
+                  smr.processed_at,
+                  smr.created_at,
+                  smr.updated_at
+                FROM public.student_makeup_requests smr
+                WHERE smr.id = :makeup_request_id
+                LIMIT 1
+                """
+            ),
+            {"makeup_request_id": makeup_request_id},
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _get_student_makeup_replacement_lesson_context(
+    db: Session,
+    *,
+    replacement_event_id: UUID,
+    replacement_class_group_id: UUID | None = None,
+):
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT
+                  e.id AS event_id,
+                  e.class_group_id AS class_group_id,
+                  cg.name AS class_group_name,
+                  cg.teacher_id AS teacher_id,
+                  t.full_name AS teacher_name,
+                  cg.court_id AS court_id,
+                  c.name AS court_name,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  (e.start_at AT TIME ZONE 'America/Sao_Paulo')::date AS lesson_date
+                FROM public.events e
+                JOIN public.class_groups cg
+                  ON cg.id = e.class_group_id
+                LEFT JOIN public.teachers t
+                  ON t.id = cg.teacher_id
+                LEFT JOIN public.courts c
+                  ON c.id = cg.court_id
+                WHERE e.id = :replacement_event_id
+                  AND e.kind = 'group_lesson'
+                  AND cg.is_active = TRUE
+                LIMIT 1
+                """
+            ),
+            {"replacement_event_id": replacement_event_id},
+        )
+        .mappings()
+        .first()
+    )
+
+    if not row:
+        return None
+
+    if (
+        replacement_class_group_id is not None
+        and row["class_group_id"] != replacement_class_group_id
+    ):
+        return None
+
+    return row
+
+
+def _list_student_makeup_replacement_lesson_options(
+    db: Session,
+    *,
+    makeup_request_id: UUID,
+    q: str | None = None,
+    from_date: date | None = None,
+    limit: int = 20,
+):
+    makeup_request = _get_student_makeup_request_detail(db, makeup_request_id=makeup_request_id)
+    if not makeup_request:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pedido de reposição não encontrado.",
+        )
+
+    params: dict[str, object] = {
+        "limit": max(1, min(limit, 100)),
+    }
+
+    where_parts = [
+        "e.kind = 'group_lesson'",
+        "cg.is_active = TRUE",
+        "e.start_at > now()",
+        "COALESCE(active.active_enrollments, 0) < cg.capacity",
+    ]
+
+    if makeup_request["original_event_id"] is not None:
+        params["original_event_id"] = makeup_request["original_event_id"]
+        where_parts.append("e.id <> :original_event_id")
+
+    if makeup_request["original_start_at"] is not None:
+        params["min_start_at"] = makeup_request["original_start_at"]
+        where_parts.append("e.start_at > :min_start_at")
+
+    if from_date is not None:
+        params["from_date"] = from_date
+        where_parts.append("(e.start_at AT TIME ZONE 'America/Sao_Paulo')::date >= :from_date")
+
+    if q and q.strip():
+        params["q"] = f"%{q.strip()}%"
+        where_parts.append(
+            """
+            (
+              cg.name ILIKE :q
+              OR COALESCE(cg.class_type, '') ILIKE :q
+              OR COALESCE(cg.level, '') ILIKE :q
+              OR COALESCE(t.full_name, '') ILIKE :q
+              OR COALESCE(c.name, '') ILIKE :q
+            )
+            """
+        )
+
+    rows = (
+        db.execute(
+            text(
+                f"""
+                WITH active AS (
+                  SELECT
+                    cge.class_group_id,
+                    COUNT(*)::int AS active_enrollments
+                  FROM public.class_group_enrollments cge
+                  WHERE cge.status = 'active'
+                  GROUP BY cge.class_group_id
+                )
+                SELECT
+                  e.id AS event_id,
+                  e.class_group_id AS class_group_id,
+                  cg.name AS class_group_name,
+                  cg.class_type AS class_type,
+                  cg.level AS level,
+                  cg.teacher_id AS teacher_id,
+                  t.full_name AS teacher_name,
+                  cg.court_id AS court_id,
+                  c.name AS court_name,
+                  (e.start_at AT TIME ZONE 'America/Sao_Paulo')::date AS lesson_date,
+                  e.start_at AS start_at,
+                  e.end_at AS end_at,
+                  cg.capacity AS capacity,
+                  COALESCE(active.active_enrollments, 0) AS active_enrollments
+                FROM public.events e
+                JOIN public.class_groups cg
+                  ON cg.id = e.class_group_id
+                LEFT JOIN active
+                  ON active.class_group_id = cg.id
+                LEFT JOIN public.teachers t
+                  ON t.id = cg.teacher_id
+                LEFT JOIN public.courts c
+                  ON c.id = cg.court_id
+                WHERE {" AND ".join(where_parts)}
+                ORDER BY e.start_at ASC, cg.name ASC
+                LIMIT :limit
+                """
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+
+    return [StudentMakeupReplacementLessonOptionOut(**row) for row in rows]
+
+
+def _review_student_makeup_request(
+    db: Session,
+    *,
+    makeup_request_id: UUID,
+    processed_by_user_id: str,
+    status_value: str,
+    admin_note: str | None,
+    replacement_event_id: UUID | None = None,
+    replacement_class_group_id: UUID | None = None,
+    replacement_teacher_id: UUID | None = None,
+    replacement_court_id: UUID | None = None,
+    replacement_lesson_date=None,
+    replacement_start_at=None,
+    replacement_end_at=None,
+):
+    return (
+        db.execute(
+            text(
+                """
+                UPDATE public.student_makeup_requests
+                SET
+                  status = :status_value,
+                  processed_by_user_id = :processed_by_user_id,
+                  processed_at = now(),
+                  admin_note = :admin_note,
+                  replacement_event_id = :replacement_event_id,
+                  replacement_class_group_id = :replacement_class_group_id,
+                  replacement_teacher_id = :replacement_teacher_id,
+                  replacement_court_id = :replacement_court_id,
+                  replacement_lesson_date = :replacement_lesson_date,
+                  replacement_start_at = :replacement_start_at,
+                  replacement_end_at = :replacement_end_at,
+                  updated_at = now()
+                WHERE id = :makeup_request_id
+                RETURNING
+                  id,
+                  student_id,
+                  class_group_enrollment_id,
+                  requested_by_user_id,
+                  processed_by_user_id,
+                  source,
+                  status,
+                  original_event_id,
+                  original_class_group_id,
+                  original_teacher_id,
+                  original_court_id,
+                  original_lesson_date,
+                  original_start_at,
+                  original_end_at,
+                  replacement_event_id,
+                  replacement_class_group_id,
+                  replacement_teacher_id,
+                  replacement_court_id,
+                  replacement_lesson_date,
+                  replacement_start_at,
+                  replacement_end_at,
+                  student_note,
+                  admin_note,
+                  requested_at,
+                  processed_at,
+                  created_at,
+                  updated_at
+                """
+            ),
+            {
+                "makeup_request_id": makeup_request_id,
+                "processed_by_user_id": processed_by_user_id,
+                "status_value": status_value,
+                "admin_note": admin_note,
+                "replacement_event_id": replacement_event_id,
+                "replacement_class_group_id": replacement_class_group_id,
+                "replacement_teacher_id": replacement_teacher_id,
+                "replacement_court_id": replacement_court_id,
+                "replacement_lesson_date": replacement_lesson_date,
+                "replacement_start_at": replacement_start_at,
+                "replacement_end_at": replacement_end_at,
+            },
+        )
+        .mappings()
+        .first()
+    )
 
 
 def _integrity_to_http(e: IntegrityError) -> HTTPException:
@@ -1169,6 +2025,220 @@ def commit_student_import(
     )
 
 
+@router.post(
+    "/me/makeup-requests",
+    response_model=StudentMakeupRequestOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_student_makeup_request_from_portal(
+    payload: StudentMakeupRequestCreateIn,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    user = _require_active_user(db, user_id)
+    student_row = _find_student_by_user_or_email(db, user_id=user_id, email=user["email"])
+
+    if not student_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhum aluno vinculado foi encontrado para este usuário.",
+        )
+
+    if not student_row["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="O cadastro deste aluno está inativo no momento.",
+        )
+
+    if payload.original_event_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Selecione a aula que será usada como base para o pedido de reposição.",
+        )
+
+    original_lesson = _get_student_makeup_original_lesson_context(
+        db,
+        student_id=student_row["id"],
+        class_group_enrollment_id=payload.class_group_enrollment_id,
+        original_event_id=payload.original_event_id,
+    )
+
+    if not original_lesson:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aula original não encontrada para a matrícula informada.",
+        )
+
+    if original_lesson["start_at"] <= db.execute(text("SELECT now()")).scalar_one():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Só é possível pedir reposição para aulas futuras.",
+        )
+
+    duplicate_request = _find_active_makeup_request_for_event(
+        db,
+        student_id=student_row["id"],
+        original_event_id=payload.original_event_id,
+    )
+    if duplicate_request:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Já existe um pedido ativo de reposição para esta aula.",
+        )
+
+    try:
+        created = _create_student_makeup_request(
+            db,
+            student_id=student_row["id"],
+            class_group_enrollment_id=payload.class_group_enrollment_id,
+            requested_by_user_id=user_id,
+            source="student_portal",
+            original_event_id=payload.original_event_id,
+            original_class_group_id=original_lesson["class_group_id"],
+            original_teacher_id=original_lesson["teacher_id"],
+            original_court_id=original_lesson["court_id"],
+            original_lesson_date=original_lesson["lesson_date"],
+            original_start_at=original_lesson["start_at"],
+            original_end_at=original_lesson["end_at"],
+            student_note=_normalize_optional_text(payload.student_note),
+        )
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise _integrity_to_http(e) from e
+
+    _send_student_makeup_request_received_email(db, makeup_request_id=created["id"])
+
+    return created
+
+
+@router.post(
+    "/makeup-requests",
+    response_model=StudentMakeupRequestOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_student_makeup_request_admin(
+    payload: StudentMakeupRequestAdminCreateIn,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+
+    enrollment_context = _get_student_makeup_enrollment_context(
+        db,
+        student_id=payload.student_id,
+        class_group_enrollment_id=payload.class_group_enrollment_id,
+    )
+    if not enrollment_context:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Matrícula ativa não encontrada para o aluno informado.",
+        )
+
+    if not enrollment_context["student_is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="O cadastro deste aluno está inativo no momento.",
+        )
+
+    original_event_id = payload.original_event_id
+    original_class_group_id = enrollment_context["class_group_id"]
+    original_teacher_id = enrollment_context["teacher_id"]
+    original_court_id = enrollment_context["court_id"]
+    original_lesson_date = payload.original_lesson_date
+    original_start_at = payload.original_start_at
+    original_end_at = payload.original_end_at
+
+    if payload.original_event_id is not None:
+        original_lesson = _get_student_makeup_original_lesson_context(
+            db,
+            student_id=payload.student_id,
+            class_group_enrollment_id=payload.class_group_enrollment_id,
+            original_event_id=payload.original_event_id,
+        )
+        if not original_lesson:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Aula original não encontrada para a matrícula informada.",
+            )
+
+        original_class_group_id = original_lesson["class_group_id"]
+        original_teacher_id = original_lesson["teacher_id"]
+        original_court_id = original_lesson["court_id"]
+        original_lesson_date = original_lesson["lesson_date"]
+        original_start_at = original_lesson["start_at"]
+        original_end_at = original_lesson["end_at"]
+    else:
+        if (
+            payload.original_lesson_date is None
+            or payload.original_start_at is None
+            or payload.original_end_at is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Informe a data e o horário da aula original ao criar a reposição manualmente.",
+            )
+
+        if payload.original_end_at <= payload.original_start_at:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="O horário final da aula original deve ser maior que o horário inicial.",
+            )
+
+    if original_start_at <= db.execute(text("SELECT now()")).scalar_one():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Só é possível registrar reposição para aulas futuras.",
+        )
+
+    if original_event_id is not None:
+        duplicate_request = _find_active_makeup_request_for_event(
+            db,
+            student_id=payload.student_id,
+            original_event_id=original_event_id,
+        )
+    else:
+        duplicate_request = _find_active_makeup_request_for_snapshot(
+            db,
+            student_id=payload.student_id,
+            class_group_enrollment_id=payload.class_group_enrollment_id,
+            original_lesson_date=original_lesson_date,
+            original_start_at=original_start_at,
+        )
+
+    if duplicate_request:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Já existe um pedido ativo de reposição para esta aula.",
+        )
+
+    try:
+        created = _create_student_makeup_request(
+            db,
+            student_id=payload.student_id,
+            class_group_enrollment_id=payload.class_group_enrollment_id,
+            requested_by_user_id=user_id,
+            source="admin_manual",
+            original_event_id=original_event_id,
+            original_class_group_id=original_class_group_id,
+            original_teacher_id=original_teacher_id,
+            original_court_id=original_court_id,
+            original_lesson_date=original_lesson_date,
+            original_start_at=original_start_at,
+            original_end_at=original_end_at,
+            student_note=_normalize_optional_text(payload.student_note),
+            admin_note=_normalize_optional_text(payload.admin_note),
+        )
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise _integrity_to_http(e) from e
+
+    _send_student_makeup_request_received_email(db, makeup_request_id=created["id"])
+
+    return created
+
+
 @router.get("/me/home", response_model=StudentHomeOut)
 def get_student_home(
     db: Annotated[Session, Depends(get_db)],
@@ -1190,6 +2260,187 @@ def get_student_home(
         )
 
     return _build_student_home_payload(db, user=user, student_row=student_row)
+
+
+@router.get("/me/makeup-requests", response_model=list[StudentMakeupRequestListItemOut])
+def list_student_makeup_requests_from_portal(
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    user = _require_active_user(db, user_id)
+    student_row = _find_student_by_user_or_email(db, user_id=user_id, email=user["email"])
+
+    if not student_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhum aluno vinculado foi encontrado para este usuário.",
+        )
+
+    if not student_row["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="O cadastro deste aluno está inativo no momento.",
+        )
+
+    return _list_student_makeup_requests(db, student_id=student_row["id"])
+
+
+@router.get(
+    "/makeup-requests",
+    response_model=list[StudentMakeupRequestListItemOut],
+)
+def list_student_makeup_requests_admin(
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    status_filter: Annotated[
+        str | None,
+        Query(
+            alias="status",
+            description="Filtra por status: pending, scheduled, rejected ou cancelled",
+        ),
+    ] = None,
+    student_id: Annotated[
+        UUID | None,
+        Query(
+            description="Filtra por aluno",
+        ),
+    ] = None,
+    q: Annotated[
+        str | None,
+        Query(
+            description="Busca por aluno, turma ou professor",
+        ),
+    ] = None,
+):
+    _require_admin(db, user_id)
+
+    return _list_admin_student_makeup_requests(
+        db,
+        status_filter=status_filter,
+        student_id=student_id,
+        q=q,
+    )
+
+
+@router.get(
+    "/makeup-requests/{makeup_request_id}/replacement-lessons",
+    response_model=list[StudentMakeupReplacementLessonOptionOut],
+)
+def list_student_makeup_replacement_lesson_options(
+    makeup_request_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    q: Annotated[
+        str | None,
+        Query(description="Busca por turma, tipo, nível, professor ou quadra"),
+    ] = None,
+    from_date: Annotated[
+        date | None,
+        Query(description="Filtra aulas a partir desta data (YYYY-MM-DD)"),
+    ] = None,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=100, description="Quantidade máxima de opções retornadas"),
+    ] = 20,
+):
+    _require_admin(db, user_id)
+
+    return _list_student_makeup_replacement_lesson_options(
+        db,
+        makeup_request_id=makeup_request_id,
+        q=q,
+        from_date=from_date,
+        limit=limit,
+    )
+
+
+@router.patch(
+    "/makeup-requests/{makeup_request_id}",
+    response_model=StudentMakeupRequestOut,
+)
+def review_student_makeup_request_admin(
+    makeup_request_id: UUID,
+    payload: StudentMakeupRequestReviewIn,
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _require_admin(db, user_id)
+
+    current_request = _get_student_makeup_request_detail(db, makeup_request_id=makeup_request_id)
+    if not current_request:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pedido de reposição não encontrado.",
+        )
+
+    if current_request["status"] != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Só é possível revisar pedidos com status pendente.",
+        )
+
+    normalized_admin_note = _normalize_optional_text(payload.admin_note)
+
+    replacement_context = None
+    if payload.status == "scheduled":
+        if payload.replacement_event_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Selecione a aula de reposição para agendar o pedido.",
+            )
+
+        if current_request["original_event_id"] == payload.replacement_event_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A aula de reposição deve ser diferente da aula original.",
+            )
+
+        replacement_context = _get_student_makeup_replacement_lesson_context(
+            db,
+            replacement_event_id=payload.replacement_event_id,
+            replacement_class_group_id=payload.replacement_class_group_id,
+        )
+        if not replacement_context:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="A aula de reposição informada não foi encontrada.",
+            )
+
+        if replacement_context["start_at"] <= db.execute(text("SELECT now()")).scalar_one():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A aula de reposição deve estar no futuro.",
+            )
+
+    try:
+        reviewed = _review_student_makeup_request(
+            db,
+            makeup_request_id=makeup_request_id,
+            processed_by_user_id=user_id,
+            status_value=payload.status,
+            admin_note=normalized_admin_note,
+            replacement_event_id=replacement_context["event_id"] if replacement_context else None,
+            replacement_class_group_id=replacement_context["class_group_id"]
+            if replacement_context
+            else None,
+            replacement_teacher_id=replacement_context["teacher_id"]
+            if replacement_context
+            else None,
+            replacement_court_id=replacement_context["court_id"] if replacement_context else None,
+            replacement_lesson_date=replacement_context["lesson_date"]
+            if replacement_context
+            else None,
+            replacement_start_at=replacement_context["start_at"] if replacement_context else None,
+            replacement_end_at=replacement_context["end_at"] if replacement_context else None,
+        )
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise _integrity_to_http(e) from e
+
+    _send_student_makeup_request_status_email(db, makeup_request_id=makeup_request_id)
+
+    return reviewed
 
 
 @router.get("/", response_model=list[StudentListItemOut])

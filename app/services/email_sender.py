@@ -3,6 +3,7 @@ from __future__ import annotations
 import smtplib
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date, datetime
 from email.message import EmailMessage
 from typing import Protocol
 
@@ -66,6 +67,44 @@ class EmailSender(Protocol):
         to_email: str,
         student_name: str,
         contact_email: str | None = None,
+    ) -> None: ...
+
+    def send_student_makeup_request_received_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
+    ) -> None: ...
+
+    def send_student_makeup_request_scheduled_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
+        replacement_class_group_name: str | None,
+        replacement_start_at: datetime | None,
+    ) -> None: ...
+
+    def send_student_makeup_request_rejected_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
+    ) -> None: ...
+
+    def send_student_makeup_request_cancelled_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
     ) -> None: ...
 
 
@@ -247,6 +286,141 @@ class BaseEmailSender:
             text_body=text_body,
             html_body=html_body,
         )
+
+    def send_student_makeup_request_received_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
+    ) -> None:
+        class_group_name = original_class_group_name or "Turma não informada"
+        lesson_datetime = _format_email_datetime(original_start_at)
+        subject = "Sócrates Tênis — Recebemos seu pedido de reposição"
+        text_body = (
+            f"Olá, {student_name}!\n\n"
+            "Recebemos seu pedido de reposição.\n\n"
+            f"Aula original: {class_group_name}\n"
+            f"Data e horário: {lesson_datetime}\n\n"
+            "Nossa equipe vai analisar a disponibilidade e retornará com a decisão.\n"
+        )
+        html_body = f"""
+        <div style="font-family:Arial,sans-serif;line-height:1.5;color:#0f172a">
+          <h2 style="margin:0 0 12px;color:#0b5fff">Sócrates Tênis</h2>
+          <p>Olá, <strong>{student_name}</strong>!</p>
+          <p>Recebemos seu pedido de reposição.</p>
+          <p><strong>Aula original:</strong> {class_group_name}<br><strong>Data e horário:</strong> {lesson_datetime}</p>
+          <p>Nossa equipe vai analisar a disponibilidade e retornará com a decisão.</p>
+        </div>
+        """
+        self.send_email(
+            to_email=to_email, subject=subject, text_body=text_body, html_body=html_body
+        )
+
+    def send_student_makeup_request_scheduled_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
+        replacement_class_group_name: str | None,
+        replacement_start_at: datetime | None,
+    ) -> None:
+        original_class = original_class_group_name or "Turma não informada"
+        original_datetime = _format_email_datetime(original_start_at)
+        replacement_class = replacement_class_group_name or "Turma não informada"
+        replacement_datetime = _format_email_datetime(replacement_start_at)
+        subject = "Sócrates Tênis — Sua reposição foi agendada"
+        text_body = (
+            f"Olá, {student_name}!\n\n"
+            "Seu pedido de reposição foi aprovado e agendado.\n\n"
+            f"Aula original: {original_class}\n"
+            f"Data original: {original_datetime}\n\n"
+            f"Reposição: {replacement_class}\n"
+            f"Nova data e horário: {replacement_datetime}\n"
+        )
+        html_body = f"""
+        <div style="font-family:Arial,sans-serif;line-height:1.5;color:#0f172a">
+          <h2 style="margin:0 0 12px;color:#0b5fff">Sócrates Tênis</h2>
+          <p>Olá, <strong>{student_name}</strong>!</p>
+          <p>Seu pedido de reposição foi aprovado e agendado.</p>
+          <p><strong>Aula original:</strong> {original_class}<br><strong>Data original:</strong> {original_datetime}</p>
+          <p><strong>Reposição:</strong> {replacement_class}<br><strong>Nova data e horário:</strong> {replacement_datetime}</p>
+        </div>
+        """
+        self.send_email(
+            to_email=to_email, subject=subject, text_body=text_body, html_body=html_body
+        )
+
+    def send_student_makeup_request_rejected_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
+    ) -> None:
+        class_group_name = original_class_group_name or "Turma não informada"
+        lesson_datetime = _format_email_datetime(original_start_at)
+        subject = "Sócrates Tênis — Seu pedido de reposição foi rejeitado"
+        text_body = (
+            f"Olá, {student_name}!\n\n"
+            "Seu pedido de reposição não pôde ser atendido neste momento.\n\n"
+            f"Aula original: {class_group_name}\n"
+            f"Data e horário: {lesson_datetime}\n"
+        )
+        html_body = f"""
+        <div style="font-family:Arial,sans-serif;line-height:1.5;color:#0f172a">
+          <h2 style="margin:0 0 12px;color:#0b5fff">Sócrates Tênis</h2>
+          <p>Olá, <strong>{student_name}</strong>!</p>
+          <p>Seu pedido de reposição não pôde ser atendido neste momento.</p>
+          <p><strong>Aula original:</strong> {class_group_name}<br><strong>Data e horário:</strong> {lesson_datetime}</p>
+        </div>
+        """
+        self.send_email(
+            to_email=to_email, subject=subject, text_body=text_body, html_body=html_body
+        )
+
+    def send_student_makeup_request_cancelled_email(
+        self,
+        *,
+        to_email: str,
+        student_name: str,
+        original_class_group_name: str | None,
+        original_start_at: datetime | None,
+    ) -> None:
+        class_group_name = original_class_group_name or "Turma não informada"
+        lesson_datetime = _format_email_datetime(original_start_at)
+        subject = "Sócrates Tênis — Seu pedido de reposição foi cancelado"
+        text_body = (
+            f"Olá, {student_name}!\n\n"
+            "Seu pedido de reposição foi cancelado.\n\n"
+            f"Aula original: {class_group_name}\n"
+            f"Data e horário: {lesson_datetime}\n"
+        )
+        html_body = f"""
+        <div style="font-family:Arial,sans-serif;line-height:1.5;color:#0f172a">
+          <h2 style="margin:0 0 12px;color:#0b5fff">Sócrates Tênis</h2>
+          <p>Olá, <strong>{student_name}</strong>!</p>
+          <p>Seu pedido de reposição foi cancelado.</p>
+          <p><strong>Aula original:</strong> {class_group_name}<br><strong>Data e horário:</strong> {lesson_datetime}</p>
+        </div>
+        """
+        self.send_email(
+            to_email=to_email, subject=subject, text_body=text_body, html_body=html_body
+        )
+
+
+def _format_email_datetime(value: datetime | date | None) -> str:
+    if value is None:
+        return "Data e horário não informados"
+
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y às %H:%M")
+
+    return value.strftime("%d/%m/%Y")
 
 
 class ConsoleEmailSender(BaseEmailSender):

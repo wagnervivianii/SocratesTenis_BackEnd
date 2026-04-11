@@ -216,3 +216,20 @@ class StudentMakeupRequestListItemOut(StudentMakeupRequestOut):
     original_teacher_name: str | None = None
     replacement_class_group_name: str | None = None
     replacement_teacher_name: str | None = None
+
+
+class StudentMakeupReplacementLessonOptionOut(BaseModel):
+    event_id: UUID
+    class_group_id: UUID | None = None
+    class_group_name: str | None = None
+    class_type: str | None = None
+    level: str | None = None
+    teacher_id: UUID | None = None
+    teacher_name: str | None = None
+    court_id: UUID | None = None
+    court_name: str | None = None
+    lesson_date: date | None = None
+    start_at: datetime
+    end_at: datetime
+    capacity: int | None = None
+    active_enrollments: int = 0

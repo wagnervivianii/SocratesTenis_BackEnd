@@ -27,6 +27,7 @@ from app.schemas.teachers import (
     TeacherEventReportOut,
     TeacherEventReportUpsertIn,
     TeacherListItemOut,
+    TeacherMakeupRequestItemOut,
     TeacherOut,
     TeacherProfileUpdateRequestCreateIn,
     TeacherProfileUpdateRequestOut,
@@ -985,6 +986,107 @@ def _build_teacher_profile_update_request_out(row) -> TeacherProfileUpdateReques
     )
 
 
+def _build_teacher_makeup_request_item_out(row) -> TeacherMakeupRequestItemOut:
+    return TeacherMakeupRequestItemOut(
+        id=row["id"],
+        student_makeup_request_id=row["id"],
+        student_id=row["student_id"],
+        student_name=row.get("student_name"),
+        status=row["status"],
+        original_event_id=row.get("original_event_id"),
+        original_class_group_id=row.get("original_class_group_id"),
+        original_class_group_name=row.get("original_class_group_name"),
+        original_teacher_id=row.get("original_teacher_id"),
+        original_teacher_name=row.get("original_teacher_name"),
+        original_court_id=row.get("original_court_id"),
+        original_court_name=row.get("original_court_name"),
+        original_lesson_date=row.get("original_lesson_date"),
+        original_start_at=row.get("original_start_at"),
+        original_end_at=row.get("original_end_at"),
+        replacement_event_id=row.get("replacement_event_id"),
+        replacement_class_group_id=row.get("replacement_class_group_id"),
+        replacement_class_group_name=row.get("replacement_class_group_name"),
+        replacement_teacher_id=row.get("replacement_teacher_id"),
+        replacement_teacher_name=row.get("replacement_teacher_name"),
+        replacement_court_id=row.get("replacement_court_id"),
+        replacement_court_name=row.get("replacement_court_name"),
+        replacement_lesson_date=row.get("replacement_lesson_date"),
+        replacement_start_at=row.get("replacement_start_at"),
+        replacement_end_at=row.get("replacement_end_at"),
+        student_note=row.get("student_note"),
+        admin_note=row.get("admin_note"),
+        requested_at=row["requested_at"],
+        processed_at=row.get("processed_at"),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _list_teacher_makeup_requests(db: Session, *, teacher_id: UUID):
+    return (
+        db.execute(
+            text(
+                """
+            SELECT
+              smr.id,
+              smr.student_id,
+              s.full_name AS student_name,
+              smr.status,
+              smr.original_event_id,
+              smr.original_class_group_id,
+              ocg.name AS original_class_group_name,
+              smr.original_teacher_id,
+              ot.full_name AS original_teacher_name,
+              smr.original_court_id,
+              oc.name AS original_court_name,
+              smr.original_lesson_date,
+              smr.original_start_at,
+              smr.original_end_at,
+              smr.replacement_event_id,
+              smr.replacement_class_group_id,
+              rcg.name AS replacement_class_group_name,
+              smr.replacement_teacher_id,
+              rt.full_name AS replacement_teacher_name,
+              smr.replacement_court_id,
+              rc.name AS replacement_court_name,
+              smr.replacement_lesson_date,
+              smr.replacement_start_at,
+              smr.replacement_end_at,
+              smr.student_note,
+              smr.admin_note,
+              smr.requested_at,
+              smr.processed_at,
+              smr.created_at,
+              smr.updated_at
+            FROM public.student_makeup_requests smr
+            JOIN public.students s
+              ON s.id = smr.student_id
+            LEFT JOIN public.class_groups ocg
+              ON ocg.id = smr.original_class_group_id
+            LEFT JOIN public.teachers ot
+              ON ot.id = smr.original_teacher_id
+            LEFT JOIN public.courts oc
+              ON oc.id = smr.original_court_id
+            LEFT JOIN public.class_groups rcg
+              ON rcg.id = smr.replacement_class_group_id
+            LEFT JOIN public.teachers rt
+              ON rt.id = smr.replacement_teacher_id
+            LEFT JOIN public.courts rc
+              ON rc.id = smr.replacement_court_id
+            WHERE smr.replacement_teacher_id = :teacher_id
+              AND smr.status = 'scheduled'
+            ORDER BY
+              smr.replacement_start_at NULLS LAST,
+              smr.requested_at DESC
+            """
+            ),
+            {"teacher_id": teacher_id},
+        )
+        .mappings()
+        .all()
+    )
+
+
 def _get_teacher_profile_update_request_or_404(db: Session, request_id: UUID):
     row = (
         db.execute(
@@ -1605,6 +1707,16 @@ def list_current_teacher_profile_update_requests(
     teacher = _resolve_current_teacher_for_user(db, user_id)
     rows = _list_teacher_profile_update_requests(db, teacher_id=teacher["id"])
     return [_build_teacher_profile_update_request_out(row) for row in rows]
+
+
+@router.get("/me/makeup-requests", response_model=list[TeacherMakeupRequestItemOut])
+def list_current_teacher_makeup_requests(
+    db: Annotated[Session, Depends(get_db)],
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    teacher = _resolve_current_teacher_for_user(db, user_id)
+    rows = _list_teacher_makeup_requests(db, teacher_id=teacher["id"])
+    return [_build_teacher_makeup_request_item_out(row) for row in rows]
 
 
 @router.get(

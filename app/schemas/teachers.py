@@ -14,6 +14,7 @@ TeacherEventIssueType = Literal[
     "other",
 ]
 TeacherProfileUpdateRequestStatus = Literal["pending", "approved", "rejected"]
+TeacherMakeupRequestStatus = Literal["pending", "scheduled", "rejected", "cancelled"]
 
 
 class TeacherCreateIn(BaseModel):
@@ -173,5 +174,38 @@ class TeacherProfileUpdateRequestOut(BaseModel):
     admin_note: str | None = None
     requested_at: datetime
     reviewed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TeacherMakeupRequestItemOut(BaseModel):
+    id: UUID
+    student_id: UUID
+    student_name: str | None = None
+    status: TeacherMakeupRequestStatus
+    original_event_id: UUID | None = None
+    original_class_group_id: UUID | None = None
+    original_class_group_name: str | None = None
+    original_teacher_id: UUID | None = None
+    original_teacher_name: str | None = None
+    original_court_id: UUID | None = None
+    original_court_name: str | None = None
+    original_lesson_date: date
+    original_start_at: datetime
+    original_end_at: datetime
+    replacement_event_id: UUID | None = None
+    replacement_class_group_id: UUID | None = None
+    replacement_class_group_name: str | None = None
+    replacement_teacher_id: UUID | None = None
+    replacement_teacher_name: str | None = None
+    replacement_court_id: UUID | None = None
+    replacement_court_name: str | None = None
+    replacement_lesson_date: date | None = None
+    replacement_start_at: datetime | None = None
+    replacement_end_at: datetime | None = None
+    student_note: str | None = None
+    admin_note: str | None = None
+    requested_at: datetime
+    processed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
