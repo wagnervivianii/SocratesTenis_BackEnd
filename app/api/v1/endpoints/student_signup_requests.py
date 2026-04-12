@@ -537,12 +537,6 @@ def _normalize_request_payload(
             )
         guardian_relationship = guardian_relationship.upper()
 
-        if guardian_whatsapp == normalized_whatsapp:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="O telefone do responsável deve ser diferente do telefone do aluno.",
-            )
-
     return {
         "full_name": normalized_full_name,
         "email": normalized_email,

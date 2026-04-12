@@ -34,6 +34,7 @@ class User(Base):
     birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     zip_code: Mapped[str | None] = mapped_column(String(8), index=True, nullable=True)
     guardian_full_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    guardian_email: Mapped[str | None] = mapped_column(Text, nullable=True)
     guardian_whatsapp: Mapped[str | None] = mapped_column(String(11), nullable=True)
     guardian_relationship: Mapped[str | None] = mapped_column(String(60), nullable=True)
 
