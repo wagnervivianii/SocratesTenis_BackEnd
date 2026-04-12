@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import Date, DateTime, ForeignKey, String, Text, func, text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,11 +23,23 @@ class StudentSignupRequest(Base):
     email: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     whatsapp: Mapped[str] = mapped_column(String(11), nullable=False, index=True)
     instagram: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    profession: Mapped[str | None] = mapped_column(Text, nullable=True)
+    share_profession: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    )
+    share_instagram: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    )
 
     birth_date: Mapped[date] = mapped_column(Date, nullable=False)
     zip_code: Mapped[str] = mapped_column(String(8), nullable=False)
 
     guardian_full_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    guardian_email: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
     guardian_whatsapp: Mapped[str | None] = mapped_column(String(11), nullable=True)
     guardian_relationship: Mapped[str | None] = mapped_column(String(60), nullable=True)
 

@@ -16,10 +16,12 @@ from app.models.student import Student
 from app.models.student_signup_request import StudentSignupRequest
 from app.models.user import User
 from app.schemas.student_signup_requests import (
+    StudentSignupRequestAdminUpdateIn,
     StudentSignupRequestCreateIn,
     StudentSignupRequestCreateOut,
     StudentSignupRequestListItemOut,
     StudentSignupRequestOut,
+    StudentSignupRequestReopenOut,
     StudentSignupRequestReviewIn,
     StudentSignupRequestReviewOut,
 )
@@ -189,9 +191,13 @@ def _to_list_item_out(
         email=request.email,
         whatsapp=request.whatsapp,
         instagram=request.instagram,
+        profession=request.profession,
+        share_profession=request.share_profession,
+        share_instagram=request.share_instagram,
         birth_date=request.birth_date,
         zip_code=request.zip_code,
         guardian_full_name=request.guardian_full_name,
+        guardian_email=request.guardian_email,
         guardian_whatsapp=request.guardian_whatsapp,
         guardian_relationship=request.guardian_relationship,
         status=request.status,
@@ -378,10 +384,10 @@ def _create_or_update_student_for_approved_request(
             email=request.email,
             phone=request.whatsapp,
             notes="Cadastro aprovado a partir de solicitação pública de aluno.",
-            profession=None,
+            profession=request.profession,
             instagram_handle=request.instagram,
-            share_profession=False,
-            share_instagram=False,
+            share_profession=request.share_profession,
+            share_instagram=request.share_instagram,
             is_active=True,
         )
         db.add(student)
@@ -404,6 +410,11 @@ def _create_or_update_student_for_approved_request(
     existing_student.full_name = existing_student.full_name or request.full_name
     existing_student.phone = existing_student.phone or request.whatsapp
     existing_student.instagram_handle = existing_student.instagram_handle or request.instagram
+    existing_student.profession = existing_student.profession or request.profession
+    existing_student.share_profession = (
+        existing_student.share_profession or request.share_profession
+    )
+    existing_student.share_instagram = existing_student.share_instagram or request.share_instagram
     existing_student.is_active = True
 
     if not was_active:
@@ -478,13 +489,15 @@ def _send_rejected_email(request: StudentSignupRequest) -> None:
         )
 
 
-@router.post("", response_model=StudentSignupRequestCreateOut, status_code=status.HTTP_201_CREATED)
-def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSession):
+def _normalize_request_payload(
+    data: StudentSignupRequestCreateIn | StudentSignupRequestAdminUpdateIn,
+):
     normalized_email = _normalize_email(str(data.email))
     normalized_full_name = _normalize_name(data.full_name, field_label="Nome completo")
     normalized_whatsapp = _normalize_whatsapp(data.whatsapp, field_label="WhatsApp")
     normalized_zip_code = _normalize_zip_code(data.zip_code)
     normalized_instagram = _normalize_instagram(data.instagram)
+    normalized_profession = _normalize_optional_text(data.profession)
 
     if data.birth_date > datetime.now(UTC).date():
         raise HTTPException(
@@ -493,6 +506,7 @@ def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSess
         )
 
     guardian_full_name = None
+    guardian_email = None
     guardian_whatsapp = None
     guardian_relationship = None
 
@@ -501,6 +515,16 @@ def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSess
             data.guardian_full_name or "",
             field_label="Nome do responsável",
         )
+        guardian_email = (
+            _normalize_email(str(data.guardian_email or "").strip())
+            if getattr(data, "guardian_email", None)
+            else None
+        )
+        if not guardian_email:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Informe o e-mail do responsável.",
+            )
         guardian_whatsapp = _normalize_whatsapp(
             data.guardian_whatsapp or "",
             field_label="Telefone do responsável",
@@ -518,6 +542,29 @@ def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSess
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="O telefone do responsável deve ser diferente do telefone do aluno.",
             )
+
+    return {
+        "full_name": normalized_full_name,
+        "email": normalized_email,
+        "whatsapp": normalized_whatsapp,
+        "instagram": normalized_instagram,
+        "profession": normalized_profession,
+        "share_profession": bool(data.share_profession),
+        "share_instagram": bool(data.share_instagram),
+        "birth_date": data.birth_date,
+        "zip_code": normalized_zip_code,
+        "guardian_full_name": guardian_full_name,
+        "guardian_email": guardian_email,
+        "guardian_whatsapp": guardian_whatsapp,
+        "guardian_relationship": guardian_relationship,
+    }
+
+
+@router.post("", response_model=StudentSignupRequestCreateOut, status_code=status.HTTP_201_CREATED)
+def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSession):
+    normalized = _normalize_request_payload(data)
+    normalized_email = normalized["email"]
+    normalized_whatsapp = normalized["whatsapp"]
 
     existing_student = db.scalar(select(Student).where(Student.email == normalized_email))
     if existing_student is not None:
@@ -557,15 +604,7 @@ def create_student_signup_request(data: StudentSignupRequestCreateIn, db: DBSess
         )
 
     request = StudentSignupRequest(
-        full_name=normalized_full_name,
-        email=normalized_email,
-        whatsapp=normalized_whatsapp,
-        instagram=normalized_instagram,
-        birth_date=data.birth_date,
-        zip_code=normalized_zip_code,
-        guardian_full_name=guardian_full_name,
-        guardian_whatsapp=guardian_whatsapp,
-        guardian_relationship=guardian_relationship,
+        **normalized,
         status="pending",
     )
     db.add(request)
@@ -626,6 +665,100 @@ def get_student_signup_request(
     approved_user = _get_approved_user_for_request(db, request)
     return StudentSignupRequestOut(
         **_to_list_item_out(request, approved_user=approved_user).model_dump()
+    )
+
+
+@router.patch("/{request_id}", response_model=StudentSignupRequestOut)
+def update_student_signup_request(
+    request_id: UUID,
+    payload: StudentSignupRequestAdminUpdateIn,
+    db: DBSession,
+    user_id: CurrentUserId,
+):
+    _require_admin(db, user_id)
+    request = _get_request_or_404(db, request_id)
+
+    if request.status == "approved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Solicitações aprovadas não podem ser editadas por este fluxo.",
+        )
+
+    normalized = _normalize_request_payload(payload)
+
+    duplicate_request = db.scalar(
+        select(StudentSignupRequest).where(
+            StudentSignupRequest.id != request.id,
+            StudentSignupRequest.status.in_(["pending", "rejected"]),
+            or_(
+                StudentSignupRequest.email == normalized["email"],
+                StudentSignupRequest.whatsapp == normalized["whatsapp"],
+            ),
+        )
+    )
+    if duplicate_request is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Já existe outra solicitação com este e-mail ou WhatsApp.",
+        )
+
+    for field_name, field_value in normalized.items():
+        setattr(request, field_name, field_value)
+
+    db.commit()
+    db.refresh(request)
+
+    approved_user = _get_approved_user_for_request(db, request)
+    return StudentSignupRequestOut(
+        **_to_list_item_out(request, approved_user=approved_user).model_dump()
+    )
+
+
+@router.post("/{request_id}/reopen", response_model=StudentSignupRequestReopenOut)
+def reopen_student_signup_request(
+    request_id: UUID,
+    db: DBSession,
+    user_id: CurrentUserId,
+):
+    _require_admin(db, user_id)
+    request = _get_request_or_404(db, request_id)
+
+    if request.status != "rejected":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Apenas solicitações rejeitadas podem ser reabertas.",
+        )
+
+    existing_pending_request = db.scalar(
+        select(StudentSignupRequest).where(
+            StudentSignupRequest.id != request.id,
+            StudentSignupRequest.status == "pending",
+            or_(
+                StudentSignupRequest.email == request.email,
+                StudentSignupRequest.whatsapp == request.whatsapp,
+            ),
+        )
+    )
+    if existing_pending_request is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Já existe outra solicitação pendente para este cadastro.",
+        )
+
+    request.status = "pending"
+    request.review_note = None
+    request.reviewed_at = None
+    request.reviewed_by_user_id = None
+    request.approved_user_id = None
+    request.approved_student_id = None
+
+    db.commit()
+    db.refresh(request)
+
+    return StudentSignupRequestReopenOut(
+        id=request.id,
+        status="pending",
+        message="Solicitação reaberta com sucesso.",
     )
 
 
