@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user_id
@@ -86,7 +86,7 @@ def _require_admin(db: Session, user_id: str) -> None:
         )
 
 
-def _integrity_to_http(e: IntegrityError) -> HTTPException:
+def _db_error_to_http(e: IntegrityError | DataError) -> HTTPException:
     orig = getattr(e, "orig", None)
     pgcode = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
 
@@ -110,12 +110,30 @@ def _integrity_to_http(e: IntegrityError) -> HTTPException:
     if pgcode == "23514":
         return HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Violação de regra de validação do banco.",
+            detail="Revise os dados informados na configuração Pix.",
+        )
+
+    if pgcode == "23502":
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Preencha todos os campos obrigatórios da configuração Pix.",
+        )
+
+    if pgcode == "22001":
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Um dos campos excede o limite de caracteres permitido.",
+        )
+
+    if pgcode == "22P02":
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Um dos campos foi informado em formato inválido.",
         )
 
     return HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"Erro ao salvar a configuração Pix: {str(orig) if orig else str(e)}",
+        detail="Não foi possível salvar a configuração Pix. Revise os dados informados e tente novamente.",
     )
 
 
@@ -280,9 +298,9 @@ def create_court_rental_payment_setting(
             .one()
         )
         db.commit()
-    except IntegrityError as e:
+    except (IntegrityError, DataError) as e:
         db.rollback()
-        raise _integrity_to_http(e) from e
+        raise _db_error_to_http(e) from e
 
     return _row_to_out(row)
 
@@ -384,9 +402,9 @@ def update_court_rental_payment_setting(
             .one()
         )
         db.commit()
-    except IntegrityError as e:
+    except (IntegrityError, DataError) as e:
         db.rollback()
-        raise _integrity_to_http(e) from e
+        raise _db_error_to_http(e) from e
 
     return _row_to_out(row)
 
@@ -436,8 +454,8 @@ def activate_court_rental_payment_setting(
             .one()
         )
         db.commit()
-    except IntegrityError as e:
+    except (IntegrityError, DataError) as e:
         db.rollback()
-        raise _integrity_to_http(e) from e
+        raise _db_error_to_http(e) from e
 
     return _row_to_out(row)
