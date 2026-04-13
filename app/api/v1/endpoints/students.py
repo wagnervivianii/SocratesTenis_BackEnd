@@ -270,10 +270,10 @@ def _get_student_home_schedule_rows(db: Session, *, class_group_ids: list[UUID])
                 FROM public.class_group_schedules cgs
                 WHERE cgs.class_group_id = ANY(:class_group_ids)
                   AND cgs.is_active = TRUE
-                  AND cgs.starts_on <= current_date
                   AND (cgs.ends_on IS NULL OR cgs.ends_on >= current_date)
                 ORDER BY
                   cgs.class_group_id ASC,
+                  cgs.starts_on ASC,
                   cgs.weekday ASC,
                   cgs.start_time ASC
                 """
