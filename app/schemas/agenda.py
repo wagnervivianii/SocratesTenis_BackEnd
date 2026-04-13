@@ -27,6 +27,30 @@ class AgendaItemOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    class_group_id: UUID | None = None
+    class_group_name: str | None = None
+    class_group_student_names: list[str] | None = None
+
+    court_rental_id: UUID | None = None
+    court_rental_origin: str | None = None
+    court_rental_pricing_profile: str | None = None
+    court_rental_payment_status: str | None = None
+    customer_name: str | None = None
+    customer_email: str | None = None
+    customer_whatsapp: str | None = None
+
+    trial_lesson_id: UUID | None = None
+    trial_user_id: UUID | None = None
+    trial_user_name: str | None = None
+    trial_user_email: str | None = None
+    trial_user_whatsapp: str | None = None
+
+    event_group: str | None = None
+    event_label: str | None = None
+    color_key: str | None = None
+    participant_label: str | None = None
+    is_recurring: bool | None = None
+
 
 class CourtDisponivelOut(BaseModel):
     court_id: UUID
